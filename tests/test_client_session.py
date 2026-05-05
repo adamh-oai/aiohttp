@@ -29,6 +29,17 @@ from aiohttp.test_utils import TestServer
 from aiohttp.tracing import Trace
 
 
+class NativeEngineStub:
+    capabilities = aiohttp.ClientEngineCapabilities()
+    allowed_protocol_schema_set = frozenset({"http", "https"})
+
+    def __init__(self) -> None:
+        self.closed = False
+
+    async def close(self) -> None:
+        self.closed = True
+
+
 @pytest.fixture
 def connector(loop):
     async def make_conn():
@@ -458,6 +469,45 @@ def test_auto_created_connector_uses_session_loop(
 
     # Clean up
     loop.run_until_complete(session.close())
+
+
+async def test_default_native_engine_is_used_without_connector(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    engine = NativeEngineStub()
+    monkeypatch.setattr(client, "get_default_native_engine", lambda: engine)
+
+    async with ClientSession() as session:
+        assert session.client_engine is engine
+        assert session.connector is None
+
+
+async def test_connector_bypasses_default_native_engine(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    get_default_native_engine = mock.Mock(return_value=NativeEngineStub())
+    monkeypatch.setattr(client, "get_default_native_engine", get_default_native_engine)
+
+    async with ClientSession(connector=TCPConnector()) as session:
+        assert isinstance(session.client_engine, aiohttp.AsyncioClientEngine)
+        assert isinstance(session.connector, TCPConnector)
+
+    get_default_native_engine.assert_not_called()
+
+
+async def test_request_uses_default_native_engine(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    engine = NativeEngineStub()
+    monkeypatch.setattr(client, "get_default_native_engine", lambda: engine)
+
+    request_context = client.request("GET", "http://python.org/")
+    try:
+        assert request_context._session.client_engine is engine
+        assert request_context._session.connector is None
+    finally:
+        request_context._coro.close()
+        await request_context._session.close()
 
 
 def test_detach(loop, session) -> None:

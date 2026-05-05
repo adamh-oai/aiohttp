@@ -69,9 +69,25 @@ extensions = [
     Extension("aiohttp._websocket.reader_c", ["aiohttp/_websocket/reader_c.c"]),
 ]
 
+rust_extensions = []
+if not NO_EXTENSIONS:
+    from setuptools_rust import Binding, RustExtension
+
+    rust_extensions.append(
+        RustExtension(
+            "aiohttp._rust_client",
+            path="rust/Cargo.toml",
+            binding=Binding.PyO3,
+        )
+    )
+
 
 build_type = "Pure" if NO_EXTENSIONS else "Accelerated"
-setup_kwargs = {} if NO_EXTENSIONS else {"ext_modules": extensions}
+setup_kwargs = (
+    {}
+    if NO_EXTENSIONS
+    else {"ext_modules": extensions, "rust_extensions": rust_extensions}
+)
 
 print("*********************", file=sys.stderr)
 print("* {build_type} build *".format_map(locals()), file=sys.stderr)

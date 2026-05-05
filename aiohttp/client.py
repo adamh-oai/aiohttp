@@ -31,6 +31,9 @@ from typing import (
     TypedDict,
     TypeVar,
     Union,
+    cast,
+    final,
+    overload,
 )
 
 import attr
@@ -72,6 +75,12 @@ from .client_exceptions import (
     WSServerHandshakeError,
 )
 from .client_middlewares import ClientMiddlewareType, build_client_middlewares
+from .client_engine import (
+    AsyncioClientEngine,
+    AttemptOptions,
+    ClientEngine,
+    UploadKind,
+)
 from .client_reqrep import (
     ClientRequest as ClientRequest,
     ClientResponse as ClientResponse,
@@ -87,6 +96,7 @@ from .client_ws import (
 from .connector import (
     HTTP_AND_EMPTY_SCHEMA_SET,
     BaseConnector as BaseConnector,
+    Connection,
     NamedPipeConnector as NamedPipeConnector,
     TCPConnector as TCPConnector,
     UnixConnector as UnixConnector,
@@ -95,7 +105,6 @@ from .cookiejar import CookieJar
 from .helpers import (
     _SENTINEL,
     DEBUG,
-    EMPTY_BODY_METHODS,
     BasicAuth,
     TimeoutHandle,
     basicauth_from_netrc,
@@ -155,6 +164,7 @@ __all__ = (
     "ClientSession",
     "ClientTimeout",
     "ClientWSTimeout",
+    "get_default_native_engine",
     "request",
     "WSMessageTypeError",
 )
@@ -164,6 +174,12 @@ if TYPE_CHECKING:
     from ssl import SSLContext
 else:
     SSLContext = None
+
+
+def get_default_native_engine() -> Optional[ClientEngine]:
+    """Return the native client engine to use for default sessions, if any."""
+    return None
+
 
 if sys.version_info >= (3, 11) and TYPE_CHECKING:
     from typing import Unpack
@@ -240,6 +256,7 @@ class ClientSession:
             "_base_url_origin",
             "_source_traceback",
             "_connector",
+            "_client_engine",
             "_loop",
             "_cookie_jar",
             "_connector_owner",
@@ -278,6 +295,7 @@ class ClientSession:
         base_url: Optional[StrOrURL] = None,
         *,
         connector: Optional[BaseConnector] = None,
+        client_engine: Optional[ClientEngine] = None,
         loop: Optional[asyncio.AbstractEventLoop] = None,
         cookies: Optional[LooseCookies] = None,
         headers: Optional[LooseHeaders] = None,
@@ -313,13 +331,13 @@ class ClientSession:
         # We initialise _connector to None immediately, as it's referenced in __del__()
         # and could cause issues if an exception occurs during initialisation.
         self._connector: Optional[BaseConnector] = None
+        self._client_engine: Optional[ClientEngine] = None
 
         if loop is None:
             if connector is not None:
                 loop = connector._loop
 
         loop = loop or asyncio.get_running_loop()
-
         if base_url is None or isinstance(base_url, URL):
             self._base_url: Optional[URL] = base_url
             self._base_url_origin = None if base_url is None else base_url.origin()
@@ -373,18 +391,63 @@ class ClientSession:
                 stacklevel=2,
             )
 
-        if connector is None:
-            connector = TCPConnector(
-                loop=loop, ssl_shutdown_timeout=ssl_shutdown_timeout
-            )
+        if client_engine is None and connector is None:
+            client_engine = get_default_native_engine()
 
-        if connector._loop is not loop:
-            raise RuntimeError("Session and connector has to use same event loop")
-
+        if client_engine is None:
+            if connector is None:
+                connector = TCPConnector(
+                    loop=loop, ssl_shutdown_timeout=ssl_shutdown_timeout
+                )
+            client_engine = AsyncioClientEngine(connector)
+        else:
+            capabilities = client_engine.capabilities
+            if connector is not None:
+                raise TypeError(
+                    "custom connectors are not supported with explicit client engines"
+                )
+            if (
+                request_class is not ClientRequest
+                and not capabilities.supports_custom_request_classes
+            ):
+                raise TypeError(
+                    "custom request_class is not supported with explicit client engines"
+                )
+            if (
+                response_class is not ClientResponse
+                and not capabilities.supports_custom_response_classes
+            ):
+                raise TypeError(
+                    "custom response_class is not supported with explicit client engines"
+                )
+            if (
+                ws_response_class is not ClientWebSocketResponse
+                and not capabilities.supports_custom_ws_response_classes
+            ):
+                raise TypeError(
+                    "custom ws_response_class is not supported with explicit client engines"
+                )
+            if connector_owner is not True:
+                raise TypeError(
+                    "connector_owner=False is not supported with explicit client engines"
+                )
+            if capabilities.supports_connectors and isinstance(
+                client_engine, AsyncioClientEngine
+            ):
+                connector = client_engine.connector
+        # Initialize these three attrs before raising any exception,
+        # they are used in __del__
+        self._connector = connector
+        self._client_engine = client_engine
         self._loop = loop
 
         if loop.get_debug():
             self._source_traceback = traceback.extract_stack(sys._getframe(1))
+        else:
+            self._source_traceback = None
+
+        if connector is not None and connector._loop is not loop:
+            raise RuntimeError("Session and connector has to use same event loop")
 
         if cookie_jar is None:
             cookie_jar = CookieJar(loop=loop)
@@ -558,8 +621,9 @@ class ClientSession:
         except ValueError as e:
             raise InvalidUrlClientError(str_or_url) from e
 
-        assert self._connector is not None
-        if url.scheme not in self._connector.allowed_protocol_schema_set:
+        client_engine = self._client_engine
+        assert client_engine is not None
+        if url.scheme not in client_engine.allowed_protocol_schema_set:
             raise NonHttpUrlClientError(url)
 
         skip_headers: Optional[Iterable[istr]]
@@ -736,41 +800,32 @@ class ClientSession:
                     async def _connect_and_send_request(
                         req: ClientRequest,
                     ) -> ClientResponse:
-                        # connection timeout
-                        assert self._connector is not None
-                        try:
-                            conn = await self._connector.connect(
-                                req, traces=traces, timeout=real_timeout
-                            )
-                        except asyncio.TimeoutError as exc:
-                            raise ConnectionTimeoutError(
-                                f"Connection timeout to host {req.url}"
-                            ) from exc
-
-                        assert conn.protocol is not None
-                        conn.protocol.set_response_params(
-                            timer=timer,
-                            skip_payload=req.method in EMPTY_BODY_METHODS,
-                            read_until_eof=read_until_eof,
-                            auto_decompress=auto_decompress,
-                            read_timeout=real_timeout.sock_read,
-                            read_bufsize=read_bufsize,
-                            timeout_ceil_threshold=self._connector._timeout_ceil_threshold,
-                            max_line_size=max_line_size,
-                            max_field_size=max_field_size,
-                            max_headers=max_headers,
+                        client_engine = self._client_engine
+                        assert client_engine is not None
+                        supported_upload_kinds = (
+                            client_engine.capabilities.supported_upload_kinds
                         )
-                        try:
-                            resp = await req.send(conn)
-                            try:
-                                await resp.start(conn)
-                            except BaseException:
-                                resp.close()
-                                raise
-                        except BaseException:
-                            conn.close()
-                            raise
-                        return resp
+                        if supported_upload_kinds != frozenset(UploadKind):
+                            upload_plan = req.upload_plan
+                            if upload_plan.kind not in supported_upload_kinds:
+                                raise NotImplementedError(
+                                    "client engine does not support "
+                                    f"{upload_plan.kind.value} uploads"
+                                )
+                        return await client_engine.send_one_attempt(
+                            req,
+                            traces,
+                            AttemptOptions(
+                                timeout=real_timeout,
+                                timer=timer,
+                                read_until_eof=read_until_eof,
+                                auto_decompress=auto_decompress,
+                                read_bufsize=read_bufsize,
+                                max_line_size=max_line_size,
+                                max_field_size=max_field_size,
+                                max_headers=max_headers,
+                            ),
+                        )
 
                     # Apply middleware (if any) - per-request middleware overrides session middleware
                     effective_middlewares = (
@@ -1024,6 +1079,11 @@ class ClientSession:
         compress: int = 0,
         max_msg_size: int = 4 * 1024 * 1024,
     ) -> ClientWebSocketResponse:
+        client_engine = self._client_engine
+        assert client_engine is not None
+        if not client_engine.capabilities.supports_websockets:
+            raise NotImplementedError("client engine does not support websockets")
+
         if timeout is not sentinel:
             if isinstance(timeout, ClientWSTimeout):
                 ws_timeout = timeout
@@ -1171,7 +1231,7 @@ class ClientSession:
                     compress = 0
                     notakeover = False
 
-            conn = resp.connection
+            conn = cast(Connection, resp.connection)
             assert conn is not None
             conn_proto = conn.protocol
             assert conn_proto is not None
@@ -1356,8 +1416,10 @@ class ClientSession:
         Release all acquired resources.
         """
         if not self.closed:
-            if self._connector is not None and self._connector_owner:
-                await self._connector.close()
+            if self._client_engine is not None:
+                if self._connector is None or self._connector_owner:
+                    await self._client_engine.close()
+            self._client_engine = None
             self._connector = None
 
     @property
@@ -1366,12 +1428,17 @@ class ClientSession:
 
         A readonly property.
         """
-        return self._connector is None or self._connector.closed
+        return self._client_engine is None or self._client_engine.closed
 
     @property
     def connector(self) -> Optional[BaseConnector]:
         """Connector instance used for the session."""
         return self._connector
+
+    @property
+    def client_engine(self) -> ClientEngine | None:
+        """Client engine used for the session."""
+        return self._client_engine
 
     @property
     def cookie_jar(self) -> AbstractCookieJar:
@@ -1468,6 +1535,11 @@ class ClientSession:
 
         Session is switched to closed state anyway.
         """
+        if self._connector is None and self._client_engine is not None:
+            raise TypeError(
+                "detach() is only supported with connector-backed client engines"
+            )
+        self._client_engine = None
         self._connector = None
 
     def __enter__(self) -> None:
@@ -1626,10 +1698,12 @@ else:
         ...    data = await resp.read()
         <ClientResponse(https://www.python.org/) [200 OK]>
         """
-        connector_owner = False
+        connector_owner = connector is None
+        client_engine: Optional[ClientEngine] = None
         if connector is None:
-            connector_owner = True
-            connector = TCPConnector(loop=loop, force_close=True)
+            client_engine = get_default_native_engine()
+            if client_engine is None:
+                connector = TCPConnector(loop=loop, force_close=True)
 
         session = ClientSession(
             loop=loop,
@@ -1637,6 +1711,7 @@ else:
             version=version,
             timeout=kwargs.pop("timeout", sentinel),
             connector=connector,
+            client_engine=client_engine,
             connector_owner=connector_owner,
         )
 

@@ -4,6 +4,8 @@ import asyncio
 import gc
 import sys
 from http.cookies import SimpleCookie
+from json import JSONDecodeError
+from types import SimpleNamespace
 from typing import Callable
 from unittest import mock
 
@@ -60,6 +62,44 @@ async def test_http_processing_error(session) -> None:
         await response.start(connection)
 
     assert info.value.request_info is request_info
+    response.close()
+
+
+async def test_start_accepts_client_exchange(session: ClientSession) -> None:
+    loop = asyncio.get_running_loop()
+    url = URL("http://engine-response.org")
+    response = ClientResponse(
+        "get",
+        url,
+        writer=WriterMock(),
+        continue100=None,
+        timer=TimerNoop(),
+        request_info=mock.Mock(),
+        traces=[],
+        loop=loop,
+        session=session,
+    )
+    payload = mock.Mock()
+    exchange = mock.Mock()
+    exchange.__aiohttp_exchange__ = True
+    exchange.connection = mock.Mock()
+    exchange.read = mock.AsyncMock(
+        return_value=(
+            SimpleNamespace(
+                code=200,
+                version=http.HttpVersion11,
+                reason="OK",
+                headers=CIMultiDictProxy(CIMultiDict()),
+                raw_headers=(),
+            ),
+            payload,
+        )
+    )
+
+    assert await response.start(exchange) is response
+    assert response.connection is exchange.connection
+    exchange.read.assert_awaited_once()
+    payload.on_eof.assert_called_once_with(response._response_eof)
     response.close()
 
 

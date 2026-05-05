@@ -35,17 +35,6 @@
 .tox
 .vimrc
 .vscode
-aiohttp/_find_header.c
-aiohttp/_headers.html
-aiohttp/_headers.pxi
-aiohttp/_http_parser.c
-aiohttp/_http_parser.html
-aiohttp/_http_writer.c
-aiohttp/_http_writer.html
-aiohttp/_websocket.c
-aiohttp/_websocket.html
-aiohttp/_websocket/mask.c
-aiohttp/_websocket/reader_c.c
 bin
 build
 coverage.xml
@@ -62,6 +51,7 @@ parts
 pip-wheel-metadata
 pyvenv
 sources
+rust/target/
 var/*
 venv
 virtualenv.py

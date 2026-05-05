@@ -38,7 +38,7 @@ Usage example::
 The client session supports the context manager protocol for self closing.
 
 .. class:: ClientSession(base_url=None, *, \
-                         connector=None, cookies=None, \
+                         connector=None, client_engine=None, cookies=None, \
                          headers=None, skip_auto_headers=None, \
                          auth=None, json_serialize=json.dumps, \
                          request_class=ClientRequest, \
@@ -88,6 +88,26 @@ The client session supports the context manager protocol for self closing.
 
    :param aiohttp.BaseConnector connector: BaseConnector
       sub-class instance to support connection pooling.
+
+   :param aiohttp.ClientEngine client_engine: Alternate client execution engine.
+      Engines other than the default asyncio engine are experimental and do not
+      support custom connectors or custom request/response classes. Experimental
+      engines may also support only a subset of upload body kinds and raise
+      :exc:`NotImplementedError` for unsupported ones.
+      :class:`aiohttp.RustClientEngine` is the first experimental native engine;
+      it currently supports ``http://`` requests plus ``https://`` requests with
+      boolean ``ssl=`` values, :class:`aiohttp.Fingerprint`, and
+      ``server_hostname=``, performs native response decompression for
+      ``gzip``, ``deflate``, ``br``, and ``zstd``, and rejects proxy,
+      :class:`ssl.SSLContext`,
+      custom ``read_bufsize=``, ``max_line_size=``, and ``max_field_size=``
+      values, and HTTP chunk-boundary reads via :meth:`StreamReader.readchunk`
+      or :meth:`StreamReader.iter_chunks`.
+
+      Applications running native-engine experiments may override
+      ``aiohttp.client.get_default_native_engine`` to return a native engine for
+      otherwise-default sessions. The hook is only consulted when neither
+      ``connector=`` nor ``client_engine=`` is supplied.
 
    :param dict cookies: Cookies to send with the request (optional)
 
@@ -294,7 +314,14 @@ The client session supports the context manager protocol for self closing.
    .. attribute:: connector
 
       :class:`aiohttp.BaseConnector` derived instance used
-      for the session.
+      for the session, or ``None`` when the session is using an explicit
+      non-connector client engine.
+
+      A read-only property.
+
+   .. attribute:: client_engine
+
+      :class:`aiohttp.ClientEngine` instance used for the session.
 
       A read-only property.
 
@@ -886,6 +913,8 @@ The client session supports the context manager protocol for self closing.
       Detach connector from session without closing the former.
 
       Session is switched to closed state anyway.
+
+      Not supported when the session is using an explicit non-connector client engine.
 
 
 
@@ -1516,12 +1545,15 @@ Response object
 
    .. attribute:: connection
 
-      :class:`Connection` used for handling response.
+      Connection handle used for handling the response. Alternate client engines
+      may expose only stable connection metadata rather than an asyncio transport
+      object.
 
    .. attribute:: content
 
-      Payload stream, which contains response's BODY (:class:`StreamReader`).
-      It supports various reading methods depending on the expected format.
+      Payload stream, which contains response's BODY. It supports the
+      :class:`StreamReader` reading API, but alternate client engines may return
+      another compatible stream implementation.
       When chunked transfer encoding is used by the server, allows retrieving
       the actual http chunks.
 

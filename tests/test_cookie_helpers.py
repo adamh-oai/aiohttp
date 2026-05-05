@@ -1095,14 +1095,6 @@ def test_parse_set_cookie_headers_date_formats_with_attributes() -> None:
 @pytest.mark.parametrize(
     ("header", "expected_name", "expected_value", "expected_coded"),
     [
-        # Test cookie values with octal escape sequences
-        (r'name="\012newline\012"', "name", "\nnewline\n", r'"\012newline\012"'),
-        (
-            r'tab="\011separated\011values"',
-            "tab",
-            "\tseparated\tvalues",
-            r'"\011separated\011values"',
-        ),
         (
             r'mixed="hello\040world\041"',
             "mixed",
@@ -1110,30 +1102,55 @@ def test_parse_set_cookie_headers_date_formats_with_attributes() -> None:
             r'"hello\040world\041"',
         ),
         (
-            r'complex="\042quoted\042 text with \012 newline"',
-            "complex",
-            '"quoted" text with \n newline',
-            r'"\042quoted\042 text with \012 newline"',
+            r'quoted="\042quoted\042"',
+            "quoted",
+            '"quoted"',
+            r'"\042quoted\042"',
         ),
     ],
 )
-def test_parse_set_cookie_headers_uses_unquote_with_octal(
+def test_parse_set_cookie_headers_uses_unquote_with_safe_octal(
     header: str, expected_name: str, expected_value: str, expected_coded: str
 ) -> None:
-    """Test that parse_set_cookie_headers correctly unquotes values with octal sequences and preserves coded_value."""
+    """Test that parse_set_cookie_headers decodes safe octal sequences and preserves coded_value."""
     result = parse_set_cookie_headers([header])
 
     assert len(result) == 1
     name, morsel = result[0]
 
-    # Check that octal sequences were properly decoded in the value
     assert name == expected_name
     assert morsel.value == expected_value
-
-    # Check that coded_value preserves the original quoted string
     assert morsel.coded_value == expected_coded
 
 
+@pytest.mark.parametrize(
+    "header",
+    [
+        r'name="\012newline\012"',
+        r'tab="\011separated\011values"',
+        r'complex="\042quoted\042 text with \012 newline"',
+    ],
+)
+def test_parse_set_cookie_headers_rejects_control_characters_from_octal_escapes(
+    header: str,
+) -> None:
+    """Test that decoded control characters are rejected consistently across Python versions."""
+    assert parse_set_cookie_headers([header]) == []
+
+
+@pytest.mark.parametrize(
+    "header",
+    [
+        r'name="\012newline\012"',
+        r'tab="\011separated\011values"',
+        r'complex="\042quoted\042 text with \012 newline"',
+    ],
+)
+def test_parse_cookie_header_rejects_control_characters_from_octal_escapes(
+    header: str,
+) -> None:
+    """Test that Cookie parsing rejects decoded control characters too."""
+    assert parse_cookie_header(header) == []
 # Tests for parse_cookie_header (RFC 6265 compliant Cookie header parser)
 
 

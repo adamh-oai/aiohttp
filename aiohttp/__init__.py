@@ -49,6 +49,21 @@ from .client import (
 )
 from .client_middleware_digest_auth import DigestAuthMiddleware
 from .client_middlewares import ClientHandlerType, ClientMiddlewareType
+from .client_engine import (
+    AsyncioClientEngine,
+    AsyncioClientExchange,
+    ClientBodyStream,
+    ClientConnection,
+    ClientEngine,
+    ClientEngineCapabilities,
+    ClientExchange,
+    PayloadUploadSource,
+    RustClientEngine,
+    UploadKind,
+    UploadPlan,
+    UploadReplayability,
+    UploadSource,
+)
 from .compression_utils import set_zlib_backend
 from .connector import (
     AddrInfoType as AddrInfoType,
@@ -180,6 +195,19 @@ __all__: Tuple[str, ...] = (
     # client_middleware
     "ClientMiddlewareType",
     "ClientHandlerType",
+    "AsyncioClientEngine",
+    "AsyncioClientExchange",
+    "RustClientEngine",
+    "ClientBodyStream",
+    "ClientConnection",
+    "ClientEngine",
+    "ClientEngineCapabilities",
+    "ClientExchange",
+    "PayloadUploadSource",
+    "UploadKind",
+    "UploadPlan",
+    "UploadReplayability",
+    "UploadSource",
     # cookiejar
     "CookieJar",
     "DummyCookieJar",

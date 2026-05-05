@@ -16,6 +16,7 @@ from typing import (
     Any,
     Callable,
     Dict,
+    FrozenSet,
     Iterable,
     List,
     Literal,
@@ -24,6 +25,8 @@ from typing import (
     Tuple,
     Type,
     Union,
+    Set,
+    cast,
 )
 
 import attr
@@ -44,6 +47,16 @@ from .client_exceptions import (
     ContentTypeError,
     InvalidURL,
     ServerFingerprintMismatch,
+)
+from .client_engine import (
+    ClientBodyStream,
+    ClientConnection,
+    ClientExchange,
+    PayloadUploadSource,
+    UploadKind,
+    UploadPlan,
+    UploadReplayability,
+    UploadSource,
 )
 from .compression_utils import HAS_BROTLI, HAS_ZSTD
 from .formdata import FormData
@@ -66,7 +79,6 @@ from .http import (
     HttpVersion11,
     StreamWriter,
 )
-from .streams import StreamReader
 from .typedefs import (
     DEFAULT_JSON_DECODER,
     JSONDecoder,
@@ -294,13 +306,14 @@ class ClientResponse(HeadersMixin):
     status: int = None  # type: ignore[assignment] # Status-Code
     reason: Optional[str] = None  # Reason-Phrase
 
-    content: StreamReader = None  # type: ignore[assignment] # Payload stream
+    content: ClientBodyStream = None  # type: ignore[assignment] # Payload stream
     _body: Optional[bytes] = None
     _headers: CIMultiDictProxy[str] = None  # type: ignore[assignment]
     _history: Tuple["ClientResponse", ...] = ()
     _raw_headers: RawHeaders = None  # type: ignore[assignment]
 
-    _connection: Optional["Connection"] = None  # current connection
+    _connection: Optional[ClientConnection] = None  # current connection
+    _exchange: Optional[ClientExchange] = None
     _cookies: Optional[SimpleCookie] = None
     _raw_cookie_headers: Optional[Tuple[str, ...]] = None
     _continue: Optional["asyncio.Future[bool]"] = None
@@ -365,6 +378,10 @@ class ClientResponse(HeadersMixin):
         _writer is only provided for backwards compatibility
         for subclasses that may need to access it.
         """
+        if getattr(self._exchange, "__aiohttp_native_exchange__", False) is True:
+            raise NotImplementedError(
+                "native client responses do not expose asyncio writer internals"
+            )
         return self.__writer
 
     @_writer.setter
@@ -481,7 +498,7 @@ class ClientResponse(HeadersMixin):
         return out.getvalue()
 
     @property
-    def connection(self) -> Optional["Connection"]:
+    def connection(self) -> Optional[ClientConnection]:
         return self._connection
 
     @reify
@@ -525,18 +542,34 @@ class ClientResponse(HeadersMixin):
 
         return MultiDictProxy(links)
 
-    async def start(self, connection: "Connection") -> "ClientResponse":
+    async def start(
+        self, connection: Union["Connection", ClientExchange]
+    ) -> "ClientResponse":
         """Start response processing."""
         self._closed = False
-        self._protocol = connection.protocol
-        self._connection = connection
+        if getattr(connection, "__aiohttp_exchange__", False) is True:
+            exchange = cast(ClientExchange, connection)
+            self._exchange = exchange
+            self._connection = exchange.connection
+
+            async def read() -> tuple[http.RawResponseMessage, ClientBodyStream]:
+                return await exchange.read()
+
+        else:
+            self._exchange = None
+            regular_connection = cast("Connection", connection)
+            self._protocol = regular_connection.protocol
+            self._connection = regular_connection
+
+            async def read() -> tuple[http.RawResponseMessage, ClientBodyStream]:
+                protocol = self._protocol
+                return await protocol.read()  # type: ignore[union-attr]
 
         with self._timer:
             while True:
                 # read response
                 try:
-                    protocol = self._protocol
-                    message, payload = await protocol.read()  # type: ignore[union-attr]
+                    message, payload = await read()
                 except http.HttpProcessingError as exc:
                     raise ClientResponseError(
                         self.request_info,
@@ -578,10 +611,15 @@ class ClientResponse(HeadersMixin):
         if self._closed:
             return
 
-        # protocol could be None because connection could be detached
-        protocol = self._connection and self._connection.protocol
-        if protocol is not None and protocol.upgraded:
+        exchange = self._exchange
+        if exchange is not None and exchange.upgraded:
             return
+        if exchange is None:
+            # protocol could be None because connection could be detached
+            connection = self._connection
+            protocol = connection and getattr(connection, "protocol", None)
+            if protocol is not None and protocol.upgraded:
+                return
 
         self._closed = True
         self._cleanup_writer()
@@ -600,7 +638,11 @@ class ClientResponse(HeadersMixin):
             return
 
         self._cleanup_writer()
-        if self._connection is not None:
+        if self._exchange is not None:
+            self._exchange.close()
+            self._exchange = None
+            self._connection = None
+        elif self._connection is not None:
             self._connection.close()
             self._connection = None
 
@@ -642,7 +684,14 @@ class ClientResponse(HeadersMixin):
             )
 
     def _release_connection(self) -> None:
-        if self._connection is not None:
+        if self._exchange is not None:
+            if self.__writer is None:
+                self._exchange.release()
+                self._exchange = None
+                self._connection = None
+            else:
+                self.__writer.add_done_callback(lambda f: self._release_connection())
+        elif self._connection is not None:
             if self.__writer is None:
                 self._connection.release()
                 self._connection = None
@@ -701,8 +750,14 @@ class ClientResponse(HeadersMixin):
         elif self._released:  # Response explicitly released
             raise ClientConnectionError("Connection closed")
 
-        protocol = self._connection and self._connection.protocol
-        if protocol is None or not protocol.upgraded:
+        exchange = self._exchange
+        if exchange is None:
+            connection = self._connection
+            protocol = connection and getattr(connection, "protocol", None)
+            upgraded = protocol is not None and protocol.upgraded
+        else:
+            upgraded = exchange.upgraded
+        if not upgraded:
             await self._wait_released()  # Underlying connection released
         return self._body
 
@@ -790,6 +845,22 @@ class ClientResponse(HeadersMixin):
         await self.wait_for_close()
 
 
+@attr.s(auto_attribs=True, frozen=True, slots=True)
+class PreparedClientRequest:
+    method: str
+    target: str
+    version: HttpVersion
+    headers: CIMultiDict[str]
+    content_length: Optional[int]
+    body: payload.Payload
+    upload_source: UploadSource
+    upload_plan: UploadPlan
+    chunked: Optional[bool]
+    compression: Optional[str]
+    expect_continue: bool
+    auto_headers: FrozenSet[str]
+
+
 class ClientRequest:
     GET_METHODS = {
         hdrs.METH_GET,
@@ -820,6 +891,7 @@ class ClientRequest:
     _continue = None  # waiter future for '100 Continue' response
 
     _skip_auto_headers: Optional["CIMultiDict[None]"] = None
+    _auto_headers: FrozenSet[str] = frozenset()
 
     # N.B.
     # Adding __del__ method with self._writer closing doesn't make sense
@@ -924,6 +996,146 @@ class ClientRequest:
             raise ValueError(
                 f"Invalid Content-Length header: {content_length_hdr}"
             ) from None
+
+    def _payload_for_engine(self) -> payload.Payload:
+        body = self._body
+        if body is None:
+            return payload.PAYLOAD_REGISTRY.get(b"", disposition=None)
+        return body
+
+    @property
+    def upload_plan(self) -> UploadPlan:
+        return self._build_upload_plan(self._payload_for_engine())
+
+    def prepare_for_send(self, *, force_close: bool) -> PreparedClientRequest:
+        """Prepare request metadata for a transport engine."""
+        if self.method == hdrs.METH_CONNECT:
+            connect_host = self.url.host_subcomponent
+            assert connect_host is not None
+            target = f"{connect_host}:{self.url.port}"
+        elif self.proxy and not self.is_ssl():
+            target = str(self.url)
+        else:
+            target = self.url.raw_path_qs
+
+        if (
+            self.method in self.POST_METHODS
+            and (
+                self._skip_auto_headers is None
+                or hdrs.CONTENT_TYPE not in self._skip_auto_headers
+            )
+            and hdrs.CONTENT_TYPE not in self.headers
+        ):
+            self.headers[hdrs.CONTENT_TYPE] = "application/octet-stream"
+
+        version = self.version
+        if hdrs.CONNECTION not in self.headers:
+            if force_close:
+                if version == HttpVersion11:
+                    self.headers[hdrs.CONNECTION] = "close"
+            elif version == HttpVersion10:
+                self.headers[hdrs.CONNECTION] = "keep-alive"
+
+        body = self._payload_for_engine()
+        content_length = self._get_content_length()
+        return PreparedClientRequest(
+            method=self.method,
+            target=target,
+            version=version,
+            headers=self.headers,
+            content_length=content_length,
+            body=body,
+            upload_source=PayloadUploadSource(body, content_length),
+            upload_plan=self._build_upload_plan(body),
+            chunked=self.chunked,
+            compression=self.compress if isinstance(self.compress, str) else None,
+            expect_continue=self._continue is not None,
+            auto_headers=self._auto_headers,
+        )
+
+    def _build_upload_plan(self, body: payload.Payload) -> UploadPlan:
+        if self._body is None:
+            kind = UploadKind.EMPTY
+            replayability = UploadReplayability.REPLAYABLE
+        elif isinstance(body, payload.BytesPayload):
+            kind = UploadKind.BUFFERED
+            replayability = UploadReplayability.REPLAYABLE
+        elif isinstance(body, multipart.MultipartWriter):
+            kind = UploadKind.MULTIPART
+            replayability = self._multipart_replayability(body)
+        elif isinstance(body, payload.IOBasePayload):
+            kind = UploadKind.FILE
+            replayability = (
+                UploadReplayability.CONSUMED
+                if body.consumed
+                else (
+                    UploadReplayability.REPLAYABLE
+                    if body.size is not None
+                    else UploadReplayability.ONE_SHOT
+                )
+            )
+        elif isinstance(body, payload.AsyncIterablePayload):
+            kind = UploadKind.ASYNC_ITERABLE
+            replayability = (
+                UploadReplayability.CONSUMED
+                if body.consumed
+                else (
+                    UploadReplayability.REPLAYABLE
+                    if body._cached_chunks is not None
+                    else UploadReplayability.ONE_SHOT
+                )
+            )
+        else:
+            kind = UploadKind.GENERIC_PAYLOAD
+            replayability = (
+                UploadReplayability.CONSUMED
+                if body.consumed
+                else UploadReplayability.UNKNOWN
+            )
+
+        return UploadPlan(
+            kind=kind,
+            size=body.size,
+            replayability=replayability,
+            autoclose=body.autoclose,
+        )
+
+    def _multipart_replayability(
+        self, body: multipart.MultipartWriter
+    ) -> UploadReplayability:
+        replayabilities = {
+            self._payload_replayability(part) for part, _encoding, _te_encoding in body
+        }
+        if UploadReplayability.CONSUMED in replayabilities:
+            return UploadReplayability.CONSUMED
+        if UploadReplayability.ONE_SHOT in replayabilities:
+            return UploadReplayability.ONE_SHOT
+        if UploadReplayability.UNKNOWN in replayabilities:
+            return UploadReplayability.UNKNOWN
+        return UploadReplayability.REPLAYABLE
+
+    def _payload_replayability(
+        self, body: payload.Payload
+    ) -> UploadReplayability:
+        if body.consumed:
+            return UploadReplayability.CONSUMED
+        if isinstance(body, payload.BytesPayload):
+            return UploadReplayability.REPLAYABLE
+        if isinstance(body, multipart.MultipartWriter):
+            return self._multipart_replayability(body)
+        if isinstance(body, payload.IOBasePayload):
+            return (
+                UploadReplayability.REPLAYABLE
+                if body.size is not None
+                else UploadReplayability.ONE_SHOT
+            )
+        if isinstance(body, payload.AsyncIterablePayload):
+            return (
+                UploadReplayability.REPLAYABLE
+                if body._cached_chunks is not None
+                else UploadReplayability.ONE_SHOT
+            )
+        return UploadReplayability.UNKNOWN
 
     @property
     def skip_auto_headers(self) -> CIMultiDict[None]:
@@ -1079,6 +1291,7 @@ class ClientRequest:
                 self.headers.add(key, value)
 
     def update_auto_headers(self, skip_auto_headers: Optional[Iterable[str]]) -> None:
+        auto_headers: Set[str] = set()
         if skip_auto_headers is not None:
             self._skip_auto_headers = CIMultiDict(
                 (hdr, None) for hdr in sorted(skip_auto_headers)
@@ -1093,9 +1306,12 @@ class ClientRequest:
         for hdr, val in self.DEFAULT_HEADERS.items():
             if hdr not in used_headers:
                 self.headers[hdr] = val
+                auto_headers.add(hdr)
 
         if hdrs.USER_AGENT not in used_headers:
             self.headers[hdrs.USER_AGENT] = SERVER_SOFTWARE
+            auto_headers.add(hdrs.USER_AGENT)
+        self._auto_headers = frozenset(auto_headers)
 
     def update_cookies(self, cookies: Optional[LooseCookies]) -> None:
         """Update request cookies header."""
@@ -1407,20 +1623,25 @@ class ClientRequest:
             await writer.write_eof()
             protocol.start_timeout()
 
-    async def send(self, conn: "Connection") -> "ClientResponse":
-        # Specify request target:
-        # - CONNECT request must send authority form URI
-        # - not CONNECT proxy must send absolute form URI
-        # - most common is origin form URI
-        if self.method == hdrs.METH_CONNECT:
-            connect_host = self.url.host_subcomponent
-            assert connect_host is not None
-            path = f"{connect_host}:{self.url.port}"
-        elif self.proxy and not self.is_ssl():
-            path = str(self.url)
-        else:
-            path = self.url.raw_path_qs
+    def _create_response(
+        self, task: Optional["asyncio.Task[None]"]
+    ) -> ClientResponse:
+        response_class = self.response_class
+        assert response_class is not None
+        self.response = response_class(
+            self.method,
+            self.original_url,
+            writer=task,
+            continue100=self._continue,
+            timer=self._timer,
+            request_info=self.request_info,
+            traces=self._traces,
+            loop=self.loop,
+            session=self._session,
+        )
+        return self.response
 
+    async def send(self, conn: "Connection") -> "ClientResponse":
         protocol = conn.protocol
         assert protocol is not None
         writer = StreamWriter(
@@ -1444,34 +1665,18 @@ class ClientRequest:
         if self.chunked is not None:
             writer.enable_chunking()
 
-        # set default content-type
-        if (
-            self.method in self.POST_METHODS
-            and (
-                self._skip_auto_headers is None
-                or hdrs.CONTENT_TYPE not in self._skip_auto_headers
-            )
-            and hdrs.CONTENT_TYPE not in self.headers
-        ):
-            self.headers[hdrs.CONTENT_TYPE] = "application/octet-stream"
-
-        v = self.version
-        if hdrs.CONNECTION not in self.headers:
-            if conn._connector.force_close:
-                if v == HttpVersion11:
-                    self.headers[hdrs.CONNECTION] = "close"
-            elif v == HttpVersion10:
-                self.headers[hdrs.CONNECTION] = "keep-alive"
-
-        # status + headers
-        status_line = f"{self.method} {path} HTTP/{v.major}.{v.minor}"
+        prepared = self.prepare_for_send(force_close=conn._connector.force_close)
+        status_line = (
+            f"{prepared.method} {prepared.target} "
+            f"HTTP/{prepared.version.major}.{prepared.version.minor}"
+        )
 
         # Buffer headers for potential coalescing with body
-        await writer.write_headers(status_line, self.headers)
+        await writer.write_headers(status_line, prepared.headers)
 
         task: Optional["asyncio.Task[None]"]
         if self._body or self._continue is not None or protocol.writing_paused:
-            coro = self.write_bytes(writer, conn, self._get_content_length())
+            coro = self.write_bytes(writer, conn, prepared.content_length)
             if sys.version_info >= (3, 12):
                 # Optimization for Python 3.12, try to write
                 # bytes immediately to avoid having to schedule
@@ -1491,20 +1696,7 @@ class ClientRequest:
             protocol.start_timeout()
             writer.set_eof()
             task = None
-        response_class = self.response_class
-        assert response_class is not None
-        self.response = response_class(
-            self.method,
-            self.original_url,
-            writer=task,
-            continue100=self._continue,
-            timer=self._timer,
-            request_info=self.request_info,
-            traces=self._traces,
-            loop=self.loop,
-            session=self._session,
-        )
-        return self.response
+        return self._create_response(task)
 
     async def close(self) -> None:
         if self.__writer is not None:

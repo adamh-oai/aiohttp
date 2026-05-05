@@ -25,6 +25,7 @@ from aiohttp.client_reqrep import (
     _gen_default_accept_encoding,
     _merge_ssl_params,
 )
+from aiohttp.client_engine import UploadKind, UploadReplayability
 from aiohttp.compression_utils import ZLibBackend
 from aiohttp.http import HttpVersion10, HttpVersion11, StreamWriter
 
@@ -694,6 +695,136 @@ async def test_connection_header(
     with mock.patch.object(conn._connector, "force_close", True):
         await req.send(conn)
     assert not req.headers.get("CONNECTION")
+
+
+async def test_prepare_for_send(make_request: _RequestMaker) -> None:
+    req = make_request(
+        "post",
+        URL("http://python.org/path?query=yes"),
+        data=b"payload",
+        expect100=True,
+    )
+
+    prepared = req.prepare_for_send(force_close=True)
+
+    assert prepared.method == "POST"
+    assert prepared.target == "/path?query=yes"
+    assert prepared.version == HttpVersion11
+    assert prepared.headers is req.headers
+    assert prepared.headers["CONNECTION"] == "close"
+    assert prepared.headers["CONTENT-TYPE"] == "application/octet-stream"
+    assert prepared.content_length == len(b"payload")
+    assert prepared.body is req.body
+    assert prepared.upload_plan.kind is UploadKind.BUFFERED
+    assert prepared.upload_plan.size == len(b"payload")
+    assert prepared.upload_plan.replayability is UploadReplayability.REPLAYABLE
+    assert prepared.upload_plan.replayable
+    assert prepared.upload_plan.autoclose
+    assert prepared.chunked is None
+    assert prepared.compression is None
+    assert prepared.expect_continue
+
+
+async def test_prepared_request_upload_source_streams_body(
+    make_request: _RequestMaker,
+) -> None:
+    req = make_request(
+        "post",
+        URL("http://python.org/"),
+        data=b"payload",
+    )
+
+    prepared = req.prepare_for_send(force_close=False)
+
+    assert [chunk async for chunk in prepared.upload_source.iter_chunks()] == [
+        b"payload"
+    ]
+
+
+async def test_prepared_request_upload_source_streams_async_iterable(
+    make_request: _RequestMaker,
+) -> None:
+    async def body() -> AsyncIterator[bytes]:
+        yield b"chunk-1"
+        yield b"chunk-2"
+
+    req = make_request("post", URL("http://python.org/"), data=body())
+
+    prepared = req.prepare_for_send(force_close=False)
+
+    assert [chunk async for chunk in prepared.upload_source.iter_chunks()] == [
+        b"chunk-1",
+        b"chunk-2",
+    ]
+
+
+async def test_prepare_for_send_empty_body(make_request: _RequestMaker) -> None:
+    req = make_request("get", URL("http://python.org/"))
+
+    prepared = req.prepare_for_send(force_close=False)
+
+    assert prepared.upload_plan.kind is UploadKind.EMPTY
+    assert prepared.upload_plan.size == 0
+    assert prepared.upload_plan.replayability is UploadReplayability.REPLAYABLE
+    assert prepared.upload_plan.replayable
+    assert prepared.upload_plan.autoclose
+
+
+async def test_prepare_for_send_async_iterable_body(
+    make_request: _RequestMaker,
+) -> None:
+    async def body() -> AsyncIterator[bytes]:
+        yield b"chunk"
+
+    req = make_request("post", URL("http://python.org/"), data=body())
+
+    prepared = req.prepare_for_send(force_close=False)
+
+    assert prepared.upload_plan.kind is UploadKind.ASYNC_ITERABLE
+    assert prepared.upload_plan.size is None
+    assert prepared.upload_plan.replayability is UploadReplayability.ONE_SHOT
+    assert not prepared.upload_plan.replayable
+    assert prepared.upload_plan.autoclose
+
+
+async def test_prepare_for_send_seekable_file_body(
+    make_request: _RequestMaker,
+) -> None:
+    req = make_request(
+        "post",
+        URL("http://python.org/"),
+        data=io.BytesIO(b"payload"),
+    )
+
+    prepared = req.prepare_for_send(force_close=False)
+
+    assert prepared.upload_plan.kind is UploadKind.FILE
+    assert prepared.upload_plan.size == len(b"payload")
+    assert prepared.upload_plan.replayability is UploadReplayability.REPLAYABLE
+    assert prepared.upload_plan.replayable
+    assert prepared.upload_plan.autoclose
+
+
+async def test_prepare_for_send_multipart_with_one_shot_part(
+    make_request: _RequestMaker,
+) -> None:
+    async def body() -> AsyncIterator[bytes]:
+        yield b"chunk"
+
+    multipart_body = aiohttp.MultipartWriter()
+    multipart_body.append(body())
+    req = make_request(
+        "post",
+        URL("http://python.org/"),
+        data=multipart_body,
+    )
+
+    prepared = req.prepare_for_send(force_close=False)
+
+    assert prepared.upload_plan.kind is UploadKind.MULTIPART
+    assert prepared.upload_plan.replayability is UploadReplayability.ONE_SHOT
+    assert not prepared.upload_plan.replayable
+    assert prepared.upload_plan.autoclose
 
 
 async def test_no_content_length(
