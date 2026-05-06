@@ -342,67 +342,25 @@ jobs:
         path: dist
 
   build-wheels:
-    name: Build wheels on ${{ matrix.os }} ${{ matrix.qemu }} ${{ matrix.musl }}
+    name: Build wheels on ${{ matrix.os }} (${{ matrix.archs }})
     runs-on: ${{ matrix.os }}
     needs: pre-deploy
     strategy:
       matrix:
-        os: ["ubuntu-latest", "macos-latest", "ubuntu-24.04-arm"]
-        qemu: ['']
-        musl: [""]
         include:
-          # Split ubuntu/musl jobs for the sake of speed-up
-        - os: ubuntu-latest
-          qemu: ppc64le
-          musl: ""
-        - os: ubuntu-latest
-          qemu: ppc64le
-          musl: musllinux
-        - os: ubuntu-latest
-          qemu: riscv64
-          musl: ""
-        - os: ubuntu-latest
-          qemu: riscv64
-          musl: musllinux
-        - os: ubuntu-latest
-          qemu: s390x
-          musl: ""
-        - os: ubuntu-latest
-          qemu: s390x
-          musl: musllinux
-        - os: ubuntu-latest
-          qemu: armv7l
-          musl: ""
-        - os: ubuntu-latest
-          qemu: armv7l
-          musl: musllinux
-        - os: ubuntu-latest
-          musl: musllinux
+        - os: ubuntu-24.04
+          archs: x86_64
         - os: ubuntu-24.04-arm
-          musl: musllinux
+          archs: aarch64
+        - os: macos-15-intel
+          archs: x86_64
+        - os: macos-14
+          archs: arm64
     steps:
     - name: Checkout
       uses: actions/checkout@v5
       with:
         submodules: true
-    - name: Set up QEMU
-      if: ${{ matrix.qemu }}
-      uses: docker/setup-qemu-action@v3
-      with:
-        platforms: all
-        # This should be temporary
-        # xref https://github.com/docker/setup-qemu-action/issues/188
-        # xref https://github.com/tonistiigi/binfmt/issues/215
-        image: tonistiigi/binfmt:qemu-v8.1.5
-      id: qemu
-    - name: Prepare emulation
-      run: |
-        if [[ -n "${{ matrix.qemu }}" ]]; then
-          # Build emulated architectures only if QEMU is set,
-          # use default "auto" otherwise
-          echo "CIBW_ARCHS_LINUX=${{ matrix.qemu }}" >> $GITHUB_ENV
-        fi
-      shell: bash
     - name: Setup Python
       uses: actions/setup-python@v6
       with:
@@ -425,17 +383,13 @@ jobs:
     - name: Build wheels
       uses: pypa/cibuildwheel@v3.2.0
       env:
-        CIBW_SKIP: pp* ${{ matrix.musl == 'musllinux' && '*manylinux*' || '*musllinux*' }}
-        CIBW_ARCHS_MACOS: x86_64 arm64 universal2
+        CIBW_SKIP: pp* *musllinux*
+        CIBW_ARCHS_LINUX: ${{ matrix.archs }}
+        CIBW_ARCHS_MACOS: ${{ matrix.archs }}
     - name: Upload wheels
       uses: actions/upload-artifact@v4
       with:
-        name: >-
-          dist-${{ matrix.os }}-${{ matrix.musl }}-${{
-            matrix.qemu
-            && matrix.qemu
-            || 'native'
-          }}
+        name: dist-${{ matrix.os }}-${{ matrix.archs }}
         path: ./wheelhouse/*.whl
 
   deploy:
