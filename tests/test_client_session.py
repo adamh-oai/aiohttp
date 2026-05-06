@@ -1263,6 +1263,11 @@ async def test_client_session_timeout_bad_argument() -> None:
         ClientSession(timeout=100)
 
 
+def test_client_session_unexpected_keyword_is_cleanup_safe() -> None:
+    with pytest.raises(TypeError):
+        ClientSession(param=1)  # type: ignore[call-arg]
+
+
 async def test_requote_redirect_url_default() -> None:
     session = ClientSession()
     assert session.requote_redirect_url

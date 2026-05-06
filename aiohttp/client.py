@@ -289,6 +289,7 @@ class ClientSession:
 
     _source_traceback: Optional[traceback.StackSummary] = None
     _connector: Optional[BaseConnector] = None
+    _client_engine: Optional[ClientEngine] = None
 
     def __init__(
         self,
@@ -328,8 +329,8 @@ class ClientSession:
         middlewares: Sequence[ClientMiddlewareType] = (),
         ssl_shutdown_timeout: Union[_SENTINEL, None, float] = sentinel,
     ) -> None:
-        # We initialise _connector to None immediately, as it's referenced in __del__()
-        # and could cause issues if an exception occurs during initialisation.
+        # These are referenced by __del__ and must be present even if later
+        # validation aborts initialisation.
         self._connector: Optional[BaseConnector] = None
         self._client_engine: Optional[ClientEngine] = None
 
