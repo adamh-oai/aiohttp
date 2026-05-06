@@ -4,11 +4,11 @@ import asyncio
 import contextlib
 import ssl
 from collections.abc import AsyncIterator, Awaitable, Callable
-from dataclasses import dataclass
 from enum import Enum
 from hashlib import sha256
 from typing import TYPE_CHECKING, NoReturn, Protocol
 
+import attr
 from multidict import CIMultiDict, CIMultiDictProxy
 
 from . import hdrs
@@ -77,7 +77,7 @@ class UploadReplayability(Enum):
     UNKNOWN = "unknown"
 
 
-@dataclass(frozen=True)
+@attr.s(auto_attribs=True, frozen=True, slots=True)
 class UploadPlan:
     kind: UploadKind
     size: int | None
@@ -178,7 +178,7 @@ class _UploadCursor:
         return chunk
 
 
-@dataclass(frozen=True)
+@attr.s(auto_attribs=True, frozen=True, slots=True)
 class ClientEngineCapabilities:
     supports_connectors: bool = False
     supports_custom_request_classes: bool = False
@@ -188,7 +188,7 @@ class ClientEngineCapabilities:
     supported_upload_kinds: frozenset[UploadKind] = frozenset(UploadKind)
 
 
-@dataclass(frozen=True)
+@attr.s(auto_attribs=True, frozen=True, slots=True)
 class AttemptOptions:
     timeout: "ClientTimeout"
     timer: BaseTimerContext

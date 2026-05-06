@@ -1436,7 +1436,7 @@ class ClientSession:
         return self._connector
 
     @property
-    def client_engine(self) -> ClientEngine | None:
+    def client_engine(self) -> Optional[ClientEngine]:
         """Client engine used for the session."""
         return self._client_engine
 
