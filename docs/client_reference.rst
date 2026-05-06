@@ -1105,6 +1105,27 @@ certification chaining.
               print(await resp.text())
 
 
+Client Engines
+--------------
+
+.. class:: ClientEngine
+
+   Protocol implemented by alternate client execution engines.
+
+   Engines are responsible for executing one request attempt and returning a
+   :class:`ClientResponse`. The default session behavior uses the asyncio-based
+   implementation internally; alternate engines may expose only the public
+   behavior documented by :class:`ClientSession`.
+
+
+.. class:: RustClientEngine()
+
+   Experimental native client engine backed by Rust networking code.
+
+   The currently supported behavior and limitations are documented on the
+   ``client_engine=`` parameter of :class:`ClientSession`.
+
+
 .. _aiohttp-client-reference-connectors:
 
 Connectors
