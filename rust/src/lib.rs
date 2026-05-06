@@ -29,7 +29,7 @@ use rustls::{
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::TcpStream;
 use tokio::sync::{mpsc, oneshot, Mutex, Notify};
-use tokio::task::AbortHandle;
+use tokio::task::{AbortHandle, JoinHandle};
 use tokio::time::timeout;
 use tokio_rustls::TlsConnector;
 use zstd::stream::write::Decoder as ZstdDecoder;
@@ -283,6 +283,7 @@ struct NativeConnection {
     sender: Arc<Mutex<http1::SendRequest<ChannelBody>>>,
     closed: Arc<AtomicBool>,
     abort_handle: AbortHandle,
+    connection_task: Arc<Mutex<Option<JoinHandle<()>>>>,
     peer_certificate_der: Option<Vec<u8>>,
 }
 
@@ -296,6 +297,30 @@ impl NativeConnection {
     fn close(&self) {
         self.closed.store(true, Ordering::Relaxed);
         self.abort_handle.abort();
+    }
+
+    fn wait_closed<'py>(slf: Py<Self>, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        let locals = pyo3_async_runtimes::tokio::get_current_locals(py)?;
+        let (closed, abort_handle, connection_task) = {
+            let connection = slf.borrow(py);
+            (
+                connection.closed.clone(),
+                connection.abort_handle.clone(),
+                connection.connection_task.clone(),
+            )
+        };
+        pyo3_async_runtimes::tokio::future_into_py_with_locals(
+            py,
+            locals.clone(),
+            pyo3_async_runtimes::tokio::scope(locals, async move {
+                closed.store(true, Ordering::Relaxed);
+                abort_handle.abort();
+                if let Some(connection_task) = connection_task.lock().await.take() {
+                    let _ = connection_task.await;
+                }
+                Ok(())
+            }),
+        )
     }
 
     fn peer_certificate_der<'py>(&self, py: Python<'py>) -> Option<Bound<'py, PyBytes>> {
@@ -526,6 +551,7 @@ where
         connection_closed.store(true, Ordering::Relaxed);
     });
     let abort_handle = connection_task.abort_handle();
+    let connection_task = Arc::new(Mutex::new(Some(connection_task)));
 
     Python::attach(|py| {
         Py::new(
@@ -534,6 +560,7 @@ where
                 sender: Arc::new(Mutex::new(sender)),
                 closed,
                 abort_handle,
+                connection_task,
                 peer_certificate_der,
             },
         )

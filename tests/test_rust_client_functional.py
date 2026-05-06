@@ -105,6 +105,27 @@ async def test_rust_engine_get_https_body_without_verification(
         assert await response.read() == b"native tls"
 
 
+async def test_rust_engine_close_waits_for_native_connections() -> None:
+    close_started = asyncio.Event()
+    allow_close = asyncio.Event()
+
+    class NativeConnection:
+        async def wait_closed(self) -> None:
+            close_started.set()
+            await allow_close.wait()
+
+    connection = NativeConnection()
+    engine = RustClientEngine()
+    engine._connections.add(connection)
+
+    close_task = asyncio.create_task(engine.close())
+    await close_started.wait()
+    assert not close_task.done()
+
+    allow_close.set()
+    await close_task
+
+
 async def test_rust_engine_uses_server_hostname_for_tls_identity(
     aiohttp_server: AiohttpServer,
     monkeypatch: pytest.MonkeyPatch,

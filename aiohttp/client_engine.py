@@ -1093,8 +1093,13 @@ class RustClientEngine:
 
     async def close(self) -> None:
         self._closed = True
-        for connection in self._connections:
-            connection.close()  # type: ignore[attr-defined]
+        connections = tuple(self._connections)
+        await asyncio.gather(
+            *(
+                connection.wait_closed()  # type: ignore[attr-defined]
+                for connection in connections
+            )
+        )
         self._available_connections.clear()
         self._connections.clear()
 
