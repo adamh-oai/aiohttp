@@ -59,6 +59,7 @@ __all__ = (
 )
 
 DEFAULT_NATIVE_READ_BUFSIZE = 2**16
+_NATIVE_TIMEOUT_ERRORS = (asyncio.TimeoutError, TimeoutError)
 
 
 class UploadKind(Enum):
@@ -667,7 +668,7 @@ class _RustClientBodyStream:
         try:
             with self._timer:
                 chunk = await self._body.next_chunk()  # type: ignore[attr-defined]
-        except asyncio.TimeoutError as exc:
+        except _NATIVE_TIMEOUT_ERRORS as exc:
             error = SocketTimeoutError("Timeout on reading data from socket")
             self._exception = error
             raise error from exc
@@ -1169,7 +1170,7 @@ class RustClientEngine:
                 max_headers=options.max_headers,
                 sock_read=options.timeout.sock_read,
             )
-        except asyncio.TimeoutError as exc:
+        except _NATIVE_TIMEOUT_ERRORS as exc:
             self._close_connection(native_connection)
             raise SocketTimeoutError("Timeout on reading data from socket") from exc
         except HttpProcessingError as exc:
@@ -1284,7 +1285,7 @@ class RustClientEngine:
             raise ClientConnectorCertificateError(request.connection_key, exc) from exc
         except ssl_errors as exc:
             raise ClientConnectorSSLError(request.connection_key, exc) from exc
-        except asyncio.TimeoutError as exc:
+        except _NATIVE_TIMEOUT_ERRORS as exc:
             raise ConnectionTimeoutError(
                 f"Connection timeout to host {key[0]}://{key[1]}:{key[2]}"
             ) from exc
