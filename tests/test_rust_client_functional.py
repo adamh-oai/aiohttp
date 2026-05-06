@@ -5,10 +5,12 @@ import ssl
 import sys
 import zlib
 from collections.abc import AsyncIterator, Callable
+from types import SimpleNamespace
 
 import aiohttp
 import pytest
 import trustme
+from yarl import URL
 
 try:
     try:
@@ -124,6 +126,40 @@ async def test_rust_engine_close_waits_for_native_connections() -> None:
 
     allow_close.set()
     await close_task
+
+
+async def test_rust_engine_waits_for_close_after_fingerprint_mismatch() -> None:
+    close_started = asyncio.Event()
+    allow_close = asyncio.Event()
+
+    class NativeConnection:
+        closed = False
+
+        def peer_certificate_der(self) -> bytes:
+            return b"certificate"
+
+        def close(self) -> None:
+            self.closed = True
+
+        async def wait_closed(self) -> None:
+            close_started.set()
+            await allow_close.wait()
+
+    connection = NativeConnection()
+    engine = RustClientEngine()
+    engine._connections.add(connection)
+    request = SimpleNamespace(url=URL("https://example.com"))
+
+    mismatch_task = asyncio.create_task(
+        engine._check_fingerprint(request, connection, b"\x00" * 32)
+    )
+    await close_started.wait()
+    assert not mismatch_task.done()
+
+    allow_close.set()
+    with pytest.raises(aiohttp.ServerFingerprintMismatch):
+        await mismatch_task
+    assert connection not in engine._connections
 
 
 async def test_rust_engine_uses_server_hostname_for_tls_identity(

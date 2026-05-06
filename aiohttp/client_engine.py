@@ -1221,7 +1221,7 @@ class RustClientEngine:
             traces=traces,
             sock_connect=options.timeout.sock_connect,
         )
-        self._check_fingerprint(request, native_connection, tls_fingerprint)
+        await self._check_fingerprint(request, native_connection, tls_fingerprint)
         try:
             if traces:
                 await request._on_headers_request_sent(
@@ -1408,7 +1408,7 @@ class RustClientEngine:
             return None
         return request.ssl.fingerprint  # type: ignore[union-attr]
 
-    def _check_fingerprint(
+    async def _check_fingerprint(
         self,
         request: "ClientRequest",
         connection: _NativeConnection,
@@ -1418,17 +1418,23 @@ class RustClientEngine:
             return
         peer_certificate_der = connection.peer_certificate_der()
         if peer_certificate_der is None:
-            self._close_connection(connection)
-            raise RuntimeError("RustClientEngine TLS connection is missing peer certificate")
+            await self._close_connection_and_wait(connection)
+            raise RuntimeError(
+                "RustClientEngine TLS connection is missing peer certificate"
+            )
         got = sha256(peer_certificate_der).digest()
         if got != expected:
-            self._close_connection(connection)
+            await self._close_connection_and_wait(connection)
             raise ServerFingerprintMismatch(
                 expected,
                 got,
                 request.url.raw_host or "",
                 request.url.port or 443,
             )
+
+    async def _close_connection_and_wait(self, connection: _NativeConnection) -> None:
+        self._close_connection(connection)
+        await connection.wait_closed()
 
     async def _open_http1_connection(
         self,

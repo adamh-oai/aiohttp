@@ -298,7 +298,6 @@ jobs:
     runs-on: ubuntu-latest
     needs:
     - lint
-    - test
     - pre-setup  # transitive, for accessing settings
     if: fromJSON(needs.pre-setup.outputs.release-requested)
     steps:
@@ -398,6 +397,7 @@ jobs:
     - build-tarball
     - build-wheels
     - pre-setup  # transitive, for accessing settings
+    - test
     runs-on: ubuntu-latest
     if: >-
       needs.pre-setup.outputs.upstream-repository-id == github.repository_id
