@@ -6,7 +6,7 @@ import ssl
 from collections.abc import AsyncIterator, Awaitable, Callable
 from enum import Enum
 from hashlib import sha256
-from typing import TYPE_CHECKING, NoReturn, Protocol, cast
+from typing import TYPE_CHECKING, NoReturn, Optional, Protocol, cast
 
 import attr
 from multidict import CIMultiDict, CIMultiDictProxy
@@ -91,7 +91,7 @@ class UploadPlan:
         return self.replayability is UploadReplayability.REPLAYABLE
 
 
-NativeConnectionKey = tuple[str, str, int, int, bool, str | None, bytes | None]
+NativeConnectionKey = tuple[str, str, int, int, bool, Optional[str], Optional[bytes]]
 
 
 class UploadSource(Protocol):
@@ -318,7 +318,7 @@ NativeResponse = tuple[
     list[tuple[bytes, bytes]],
     _NativeBody,
     bool,
-    str | None,
+    Optional[str],
     bool,
     bool,
 ]
