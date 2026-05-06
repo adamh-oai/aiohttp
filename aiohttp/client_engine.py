@@ -77,7 +77,7 @@ class UploadReplayability(Enum):
     UNKNOWN = "unknown"
 
 
-@dataclass(frozen=True, slots=True)
+@dataclass(frozen=True)
 class UploadPlan:
     kind: UploadKind
     size: int | None
@@ -170,7 +170,7 @@ class _UploadCursor:
 
     async def next_chunk(self) -> bytes | None:
         try:
-            chunk = await anext(self._iterator)
+            chunk = await self._iterator.__anext__()
         except StopAsyncIteration:
             return None
         if self._on_chunk is not None:
@@ -178,7 +178,7 @@ class _UploadCursor:
         return chunk
 
 
-@dataclass(frozen=True, slots=True)
+@dataclass(frozen=True)
 class ClientEngineCapabilities:
     supports_connectors: bool = False
     supports_custom_request_classes: bool = False
@@ -188,7 +188,7 @@ class ClientEngineCapabilities:
     supported_upload_kinds: frozenset[UploadKind] = frozenset(UploadKind)
 
 
-@dataclass(frozen=True, slots=True)
+@dataclass(frozen=True)
 class AttemptOptions:
     timeout: "ClientTimeout"
     timer: BaseTimerContext
