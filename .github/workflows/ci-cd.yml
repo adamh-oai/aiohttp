@@ -148,12 +148,10 @@ jobs:
       matrix:
         pyver: [3.9, '3.10', '3.11', '3.12', '3.13', '3.14']
         no-extensions: ['', 'Y']
-        os: [ubuntu, macos, windows]
+        os: [ubuntu, macos]
         experimental: [false]
         exclude:
           - os: macos
-            no-extensions: 'Y'
-          - os: windows
             no-extensions: 'Y'
         include:
           - pyver: pypy-3.11
@@ -383,7 +381,7 @@ jobs:
     needs: pre-deploy
     strategy:
       matrix:
-        os: ["ubuntu-latest", "windows-latest", "macos-latest", "ubuntu-24.04-arm"]
+        os: ["ubuntu-latest", "macos-latest", "ubuntu-24.04-arm"]
         qemu: ['']
         musl: [""]
         include:

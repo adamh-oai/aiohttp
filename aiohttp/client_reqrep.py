@@ -563,7 +563,8 @@ class ClientResponse(HeadersMixin):
 
             async def read() -> tuple[http.RawResponseMessage, ClientBodyStream]:
                 protocol = self._protocol
-                return await protocol.read()  # type: ignore[union-attr]
+                assert protocol is not None
+                return await protocol.read()
 
         with self._timer:
             while True:
@@ -616,8 +617,8 @@ class ClientResponse(HeadersMixin):
             return
         if exchange is None:
             # protocol could be None because connection could be detached
-            connection = self._connection
-            protocol = connection and getattr(connection, "protocol", None)
+            connection = cast(Optional["Connection"], self._connection)
+            protocol = connection.protocol if connection is not None else None
             if protocol is not None and protocol.upgraded:
                 return
 
@@ -752,8 +753,8 @@ class ClientResponse(HeadersMixin):
 
         exchange = self._exchange
         if exchange is None:
-            connection = self._connection
-            protocol = connection and getattr(connection, "protocol", None)
+            connection = cast(Optional["Connection"], self._connection)
+            protocol = connection.protocol if connection is not None else None
             upgraded = protocol is not None and protocol.upgraded
         else:
             upgraded = exchange.upgraded

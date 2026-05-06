@@ -6,12 +6,13 @@ import ssl
 from collections.abc import AsyncIterator, Awaitable, Callable
 from enum import Enum
 from hashlib import sha256
-from typing import TYPE_CHECKING, NoReturn, Protocol
+from typing import TYPE_CHECKING, NoReturn, Protocol, cast
 
 import attr
 from multidict import CIMultiDict, CIMultiDictProxy
 
 from . import hdrs
+from .abc import AbstractStreamWriter
 from .client_exceptions import (
     ClientConnectorCertificateError,
     ClientConnectorSSLError,
@@ -30,9 +31,9 @@ from .compression_utils import (
     ZLibDecompressor,
     ZSTDDecompressor,
 )
-from .helpers import EMPTY_BODY_METHODS, BaseTimerContext, TimerNoop
+from .helpers import EMPTY_BODY_METHODS, _EXC_SENTINEL, BaseTimerContext, TimerNoop
 from .http import HttpVersion
-from .http_exceptions import ContentEncodingError, HttpProcessingError
+from .http_exceptions import ContentEncodingError, HttpProcessingError, LineTooLong
 from .http_parser import RawResponseMessage
 
 if TYPE_CHECKING:
@@ -90,15 +91,18 @@ class UploadPlan:
         return self.replayability is UploadReplayability.REPLAYABLE
 
 
+NativeConnectionKey = tuple[str, str, int, int, bool, str | None, bytes | None]
+
+
 class UploadSource(Protocol):
-    async def iter_chunks(self) -> AsyncIterator[bytes]: ...
+    def iter_chunks(self) -> AsyncIterator[bytes]: ...
 
 
-class _ChunkQueueWriter:
+class _ChunkQueueWriter(AbstractStreamWriter):
     def __init__(self) -> None:
         self._queue: asyncio.Queue[bytes | None] = asyncio.Queue(maxsize=1)
 
-    async def write(self, chunk: bytes) -> None:
+    async def write(self, chunk: bytes | bytearray | memoryview) -> None:
         if chunk:
             await self._queue.put(bytes(chunk))
 
@@ -118,6 +122,11 @@ class _ChunkQueueWriter:
         raise NotImplementedError("upload source writer does not support chunking")
 
     def send_headers(self) -> None:
+        pass
+
+    async def write_headers(
+        self, status_line: str, headers: "CIMultiDict[str]"
+    ) -> None:
         pass
 
     async def finish(self) -> None:
@@ -203,7 +212,9 @@ class AttemptOptions:
 
 class ClientEngine(Protocol):
     capabilities: ClientEngineCapabilities
-    allowed_protocol_schema_set: frozenset[str]
+
+    @property
+    def allowed_protocol_schema_set(self) -> frozenset[str]: ...
 
     async def send_one_attempt(
         self,
@@ -246,16 +257,18 @@ class ClientBodyStream(Protocol):
 
     async def readexactly(self, n: int) -> bytes: ...
 
-    async def readline(self) -> bytes: ...
+    async def readline(self, *, max_line_length: int | None = None) -> bytes: ...
 
-    async def readuntil(self, separator: bytes = b"\n") -> bytes: ...
+    async def readuntil(
+        self, separator: bytes = b"\n", *, max_size: int | None = None
+    ) -> bytes: ...
 
     async def readchunk(self) -> tuple[bytes, bool]: ...
 
-    def exception(self) -> type[BaseException] | BaseException | None: ...
+    def exception(self) -> BaseException | None: ...
 
     def set_exception(
-        self, exc: type[BaseException] | BaseException, exc_cause: BaseException = ...
+        self, exc: BaseException, exc_cause: BaseException = _EXC_SENTINEL
     ) -> None: ...
 
     def on_eof(self, callback: Callable[[], None]) -> None: ...
@@ -270,10 +283,77 @@ class ClientBodyStream(Protocol):
 
     def unread_data(self, data: bytes) -> None: ...
 
-    def close(self) -> None: ...
-
     @property
     def total_raw_bytes(self) -> int: ...
+
+
+class _ClosableClientBodyStream(ClientBodyStream, Protocol):
+    def close(self) -> None: ...
+
+
+class _NativeBody(Protocol):
+    @property
+    def total_raw_bytes(self) -> int: ...
+
+    async def next_chunk(self) -> bytes | None: ...
+
+    def close(self) -> None: ...
+
+
+class _NativeConnection(Protocol):
+    @property
+    def closed(self) -> bool: ...
+
+    async def wait_closed(self) -> None: ...
+
+    def close(self) -> None: ...
+
+    def peer_certificate_der(self) -> bytes | None: ...
+
+
+NativeResponse = tuple[
+    int,
+    int,
+    str,
+    list[tuple[bytes, bytes]],
+    _NativeBody,
+    bool,
+    str | None,
+    bool,
+    bool,
+]
+
+
+class _RustClientModule(Protocol):
+    async def open_http1_connection(
+        self,
+        host: str,
+        port: int,
+        max_headers: int,
+        sock_connect: float | None,
+        tls: bool,
+        verify_tls: bool,
+        tls_server_name: str | None,
+    ) -> _NativeConnection: ...
+
+    async def send_http1_request(
+        self,
+        connection: _NativeConnection,
+        method: str,
+        target: str,
+        version_major: int,
+        version_minor: int,
+        headers: list[tuple[str, str]],
+        upload_cursor: "_UploadCursor",
+        content_length: int | None,
+        compression: str | None,
+        expect_continue: bool,
+        read_until_eof: bool,
+        auto_decompress: bool,
+        skip_payload: bool,
+        max_headers: int,
+        sock_read: float | None,
+    ) -> NativeResponse: ...
 
 
 class ClientExchange(Protocol):
@@ -391,7 +471,7 @@ class _BufferedClientBodyStream:
     def __init__(self, body: bytes) -> None:
         self._buffer = body
         self._offset = 0
-        self._exception: type[BaseException] | BaseException | None = None
+        self._exception: BaseException | None = None
         self._on_eof: list[Callable[[], None]] = []
         self._eof_notified = False
         self._total_raw_bytes = len(body)
@@ -426,33 +506,35 @@ class _BufferedClientBodyStream:
             raise asyncio.IncompleteReadError(chunk, n)
         return chunk
 
-    async def readline(self) -> bytes:
-        self._raise_exception()
-        remaining = self._buffer[self._offset :]
-        newline = remaining.find(b"\n")
-        if newline < 0:
-            return self.read_nowait()
-        return self.read_nowait(newline + 1)
+    async def readline(self, *, max_line_length: int | None = None) -> bytes:
+        return await self.readuntil(max_size=max_line_length)
 
-    async def readuntil(self, separator: bytes = b"\n") -> bytes:
+    async def readuntil(
+        self, separator: bytes = b"\n", *, max_size: int | None = None
+    ) -> bytes:
         if not separator:
             raise ValueError("Separator should be at least one-byte string")
         self._raise_exception()
         remaining = self._buffer[self._offset :]
         index = remaining.find(separator)
         if index < 0:
+            if max_size is not None and len(remaining) > max_size:
+                raise LineTooLong(remaining[:100] + b"...", max_size)
             partial = self.read_nowait()
             raise asyncio.IncompleteReadError(partial, None)
-        return self.read_nowait(index + len(separator))
+        end = index + len(separator)
+        if max_size is not None and end > max_size:
+            raise LineTooLong(remaining[:100] + b"...", max_size)
+        return self.read_nowait(end)
 
     async def readchunk(self) -> tuple[bytes, bool]:
         return await self.read(), False
 
-    def exception(self) -> type[BaseException] | BaseException | None:
+    def exception(self) -> BaseException | None:
         return self._exception
 
     def set_exception(
-        self, exc: type[BaseException] | BaseException, exc_cause: BaseException = ...
+        self, exc: BaseException, exc_cause: BaseException = _EXC_SENTINEL
     ) -> None:
         self._exception = exc
 
@@ -504,11 +586,8 @@ class _BufferedClientBodyStream:
         return self._total_raw_bytes
 
     def _raise_exception(self) -> None:
-        if self._exception is None:
-            return
-        if isinstance(self._exception, type):
-            raise self._exception()
-        raise self._exception
+        if self._exception is not None:
+            raise self._exception
 
     def _notify_eof_if_needed(self) -> None:
         if not self.at_eof() or self._eof_notified:
@@ -523,7 +602,7 @@ class _BufferedClientBodyStream:
 class _RustClientBodyStream:
     def __init__(
         self,
-        body: object,
+        body: _NativeBody,
         timer: BaseTimerContext,
         compression: str | None = None,
     ) -> None:
@@ -532,7 +611,7 @@ class _RustClientBodyStream:
         self._compression = compression
         self._buffer = bytearray()
         self._eof = False
-        self._exception: type[BaseException] | BaseException | None = None
+        self._exception: BaseException | None = None
         self._on_eof: list[Callable[[], None]] = []
         self._eof_notified = False
 
@@ -587,17 +666,24 @@ class _RustClientBodyStream:
             raise asyncio.IncompleteReadError(chunk, n)
         return chunk
 
-    async def readline(self) -> bytes:
-        return await self.readuntil(b"\n")
+    async def readline(self, *, max_line_length: int | None = None) -> bytes:
+        return await self.readuntil(b"\n", max_size=max_line_length)
 
-    async def readuntil(self, separator: bytes = b"\n") -> bytes:
+    async def readuntil(
+        self, separator: bytes = b"\n", *, max_size: int | None = None
+    ) -> bytes:
         if not separator:
             raise ValueError("Separator should be at least one-byte string")
         self._raise_exception()
         while True:
             index = self._buffer.find(separator)
             if index >= 0:
-                return self.read_nowait(index + len(separator))
+                end = index + len(separator)
+                if max_size is not None and end > max_size:
+                    raise LineTooLong(bytes(self._buffer[:100]) + b"...", max_size)
+                return self.read_nowait(end)
+            if max_size is not None and len(self._buffer) > max_size:
+                raise LineTooLong(bytes(self._buffer[:100]) + b"...", max_size)
             if self._eof:
                 return self.read_nowait()
             await self._read_next_chunk()
@@ -607,11 +693,11 @@ class _RustClientBodyStream:
             "RustClientEngine does not support HTTP chunk-boundary reads yet"
         )
 
-    def exception(self) -> type[BaseException] | BaseException | None:
+    def exception(self) -> BaseException | None:
         return self._exception
 
     def set_exception(
-        self, exc: type[BaseException] | BaseException, exc_cause: BaseException = ...
+        self, exc: BaseException, exc_cause: BaseException = _EXC_SENTINEL
     ) -> None:
         self._exception = exc
 
@@ -647,13 +733,13 @@ class _RustClientBodyStream:
             self._buffer[:0] = data
 
     def close(self) -> None:
-        self._body.close()  # type: ignore[attr-defined]
+        self._body.close()
         self._eof = True
         self._notify_eof()
 
     @property
     def total_raw_bytes(self) -> int:
-        return self._body.total_raw_bytes  # type: ignore[attr-defined]
+        return self._body.total_raw_bytes
 
     async def _fill_to(self, n: int) -> None:
         while len(self._buffer) < n and not self._eof:
@@ -667,7 +753,7 @@ class _RustClientBodyStream:
         self._raise_exception()
         try:
             with self._timer:
-                chunk = await self._body.next_chunk()  # type: ignore[attr-defined]
+                chunk = await self._body.next_chunk()
         except _NATIVE_TIMEOUT_ERRORS as exc:
             error = SocketTimeoutError("Timeout on reading data from socket")
             self._exception = error
@@ -692,11 +778,8 @@ class _RustClientBodyStream:
         raise error from exc
 
     def _raise_exception(self) -> None:
-        if self._exception is None:
-            return
-        if isinstance(self._exception, type):
-            raise self._exception()
-        raise self._exception
+        if self._exception is not None:
+            raise self._exception
 
     def _notify_eof(self) -> None:
         if self._eof_notified:
@@ -709,14 +792,14 @@ class _RustClientBodyStream:
 
 
 class _DecompressingClientBodyStream:
-    def __init__(self, body: ClientBodyStream, encoding: str) -> None:
+    def __init__(self, body: _ClosableClientBodyStream, encoding: str) -> None:
         self._body = body
         self._encoding = encoding
         self._decompressor = self._make_decompressor(encoding)
         self._started_decoding = False
         self._buffer = bytearray()
         self._eof = False
-        self._exception: type[BaseException] | BaseException | None = None
+        self._exception: BaseException | None = None
         self._on_eof: list[Callable[[], None]] = []
         self._eof_notified = False
 
@@ -771,17 +854,24 @@ class _DecompressingClientBodyStream:
             raise asyncio.IncompleteReadError(chunk, n)
         return chunk
 
-    async def readline(self) -> bytes:
-        return await self.readuntil(b"\n")
+    async def readline(self, *, max_line_length: int | None = None) -> bytes:
+        return await self.readuntil(b"\n", max_size=max_line_length)
 
-    async def readuntil(self, separator: bytes = b"\n") -> bytes:
+    async def readuntil(
+        self, separator: bytes = b"\n", *, max_size: int | None = None
+    ) -> bytes:
         if not separator:
             raise ValueError("Separator should be at least one-byte string")
         self._raise_exception()
         while True:
             index = self._buffer.find(separator)
             if index >= 0:
-                return self.read_nowait(index + len(separator))
+                end = index + len(separator)
+                if max_size is not None and end > max_size:
+                    raise LineTooLong(bytes(self._buffer[:100]) + b"...", max_size)
+                return self.read_nowait(end)
+            if max_size is not None and len(self._buffer) > max_size:
+                raise LineTooLong(bytes(self._buffer[:100]) + b"...", max_size)
             if self._eof:
                 return self.read_nowait()
             await self._read_next_chunk()
@@ -791,11 +881,11 @@ class _DecompressingClientBodyStream:
             "RustClientEngine does not support HTTP chunk-boundary reads yet"
         )
 
-    def exception(self) -> type[BaseException] | BaseException | None:
+    def exception(self) -> BaseException | None:
         return self._exception
 
     def set_exception(
-        self, exc: type[BaseException] | BaseException, exc_cause: BaseException = ...
+        self, exc: BaseException, exc_cause: BaseException = _EXC_SENTINEL
     ) -> None:
         self._exception = exc
 
@@ -831,7 +921,7 @@ class _DecompressingClientBodyStream:
             self._buffer[:0] = data
 
     def close(self) -> None:
-        self._body.close()  # type: ignore[attr-defined]
+        self._body.close()
         self._eof = True
         self._notify_eof()
 
@@ -872,7 +962,7 @@ class _DecompressingClientBodyStream:
         chunks = []
         try:
             chunks.append(self._decompressor.decompress_sync(chunk))
-            while self._decompressor.data_available:
+            while getattr(self._decompressor, "data_available", False):
                 chunks.append(self._decompressor.decompress_sync(b""))
         except Exception as exc:
             raise ContentEncodingError(
@@ -909,11 +999,8 @@ class _DecompressingClientBodyStream:
         raise error from exc
 
     def _raise_exception(self) -> None:
-        if self._exception is None:
-            return
-        if isinstance(self._exception, type):
-            raise self._exception()
-        raise self._exception
+        if self._exception is not None:
+            raise self._exception
 
     def _notify_eof(self) -> None:
         if self._eof_notified:
@@ -952,18 +1039,18 @@ class _RustClientExchange:
     def __init__(
         self,
         message: RawResponseMessage,
-        body: bytes | object,
+        body: bytes | _NativeBody,
         *,
         engine: "RustClientEngine | None" = None,
-        connection_key: tuple[str, str, int, int] | None = None,
-        native_connection: object | None = None,
+        connection_key: NativeConnectionKey | None = None,
+        native_connection: _NativeConnection | None = None,
         force_close: bool = False,
         timer: BaseTimerContext | None = None,
         auto_decompress: bool = False,
         compression: str | None = None,
     ) -> None:
         self._message = message
-        body_stream: ClientBodyStream = (
+        body_stream: _ClosableClientBodyStream = (
             _BufferedClientBodyStream(body)
             if isinstance(body, bytes)
             else _RustClientBodyStream(
@@ -1005,7 +1092,7 @@ class _RustClientExchange:
         if self._released:
             return True
         native_connection = self._native_connection
-        return native_connection is not None and native_connection.closed  # type: ignore[attr-defined]
+        return native_connection is not None and native_connection.closed
 
     def add_callback(self, callback: Callable[[], None]) -> None:
         if self.closed:
@@ -1083,9 +1170,9 @@ class RustClientEngine:
     def __init__(self) -> None:
         self._closed = False
         self._available_connections: dict[
-            tuple[str, str, int, int, bool, str | None, bytes | None], list[object]
+            NativeConnectionKey, list[_NativeConnection]
         ] = {}
-        self._connections: set[object] = set()
+        self._connections: set[_NativeConnection] = set()
 
     @property
     def closed(self) -> bool:
@@ -1095,10 +1182,7 @@ class RustClientEngine:
         self._closed = True
         connections = tuple(self._connections)
         await asyncio.gather(
-            *(
-                connection.wait_closed()  # type: ignore[attr-defined]
-                for connection in connections
-            )
+            *(connection.wait_closed() for connection in connections)
         )
         self._available_connections.clear()
         self._connections.clear()
@@ -1260,16 +1344,16 @@ class RustClientEngine:
 
     async def _acquire_connection(
         self,
-        key: tuple[str, str, int, int, bool, str | None, bytes | None],
+        key: NativeConnectionKey,
         *,
         request: "ClientRequest",
         traces: list["Trace"],
         sock_connect: float | None,
-    ) -> object:
+    ) -> _NativeConnection:
         available = self._available_connections.get(key)
         while available:
             connection = available.pop()
-            if not connection.closed:  # type: ignore[attr-defined]
+            if not connection.closed:
                 for trace in traces:
                     await trace.send_connection_reuseconn()
                 return connection
@@ -1299,16 +1383,16 @@ class RustClientEngine:
 
     def _release_connection(
         self,
-        key: tuple[str, str, int, int, bool, str | None, bytes | None],
-        connection: object,
+        key: NativeConnectionKey,
+        connection: _NativeConnection,
     ) -> None:
-        if self._closed or connection.closed:  # type: ignore[attr-defined]
+        if self._closed or connection.closed:
             self._close_connection(connection)
             return
         self._available_connections.setdefault(key, []).append(connection)
 
-    def _close_connection(self, connection: object) -> None:
-        connection.close()  # type: ignore[attr-defined]
+    def _close_connection(self, connection: _NativeConnection) -> None:
+        connection.close()
         self._connections.discard(connection)
 
     def _request_forces_close(self, prepared: "PreparedClientRequest") -> bool:
@@ -1327,12 +1411,12 @@ class RustClientEngine:
     def _check_fingerprint(
         self,
         request: "ClientRequest",
-        connection: object,
+        connection: _NativeConnection,
         expected: bytes | None,
     ) -> None:
         if expected is None or request.url.scheme != "https":
             return
-        peer_certificate_der = connection.peer_certificate_der()  # type: ignore[attr-defined]
+        peer_certificate_der = connection.peer_certificate_der()
         if peer_certificate_der is None:
             self._close_connection(connection)
             raise RuntimeError("RustClientEngine TLS connection is missing peer certificate")
@@ -1357,7 +1441,7 @@ class RustClientEngine:
         tls_fingerprint: bytes | None,
         *,
         sock_connect: float | None,
-    ) -> object:
+    ) -> _NativeConnection:
         try:
             from . import _rust_client
         except ImportError as exc:
@@ -1365,7 +1449,8 @@ class RustClientEngine:
                 "RustClientEngine requires the aiohttp._rust_client extension"
             ) from exc
 
-        return await _rust_client.open_http1_connection(
+        rust_client = cast(_RustClientModule, _rust_client)
+        return await rust_client.open_http1_connection(
             host,
             port,
             max_headers,
@@ -1377,7 +1462,7 @@ class RustClientEngine:
 
     async def _send_http1_request(
         self,
-        connection: object,
+        connection: _NativeConnection,
         method: str,
         target: str,
         version_major: int,
@@ -1393,17 +1478,7 @@ class RustClientEngine:
         skip_payload: bool,
         max_headers: int,
         sock_read: float | None,
-    ) -> tuple[
-        int,
-        int,
-        str,
-        list[tuple[bytes, bytes]],
-        object,
-        bool,
-        str | None,
-        bool,
-        bool,
-    ]:
+    ) -> NativeResponse:
         try:
             from . import _rust_client
         except ImportError as exc:
@@ -1411,7 +1486,8 @@ class RustClientEngine:
                 "RustClientEngine requires the aiohttp._rust_client extension"
             ) from exc
 
-        return await _rust_client.send_http1_request(
+        rust_client = cast(_RustClientModule, _rust_client)
+        return await rust_client.send_http1_request(
             connection,
             method,
             target,

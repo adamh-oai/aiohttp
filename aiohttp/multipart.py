@@ -52,8 +52,6 @@ from .payload import (
     get_payload,
     payload_type,
 )
-from .streams import StreamReader
-
 if sys.version_info >= (3, 11):
     from typing import Self
 else:
@@ -73,6 +71,7 @@ __all__ = (
 
 
 if TYPE_CHECKING:
+    from .client_engine import ClientBodyStream
     from .client_reqrep import ClientResponse
 
 
@@ -276,7 +275,7 @@ class BodyPartReader:
         self,
         boundary: bytes,
         headers: "CIMultiDictProxy[str]",
-        content: StreamReader,
+        content: "ClientBodyStream",
         *,
         subtype: str = "mixed",
         default_charset: Optional[str] = None,
@@ -662,7 +661,7 @@ class MultipartReader:
     def __init__(
         self,
         headers: Mapping[str, str],
-        content: StreamReader,
+        content: "ClientBodyStream",
         *,
         max_field_size: int = 8190,
         max_headers: int = 128,

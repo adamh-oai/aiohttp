@@ -223,8 +223,10 @@ def parse_cookie_header(header: str) -> List[Tuple[str, Morsel[str]]]:
                 if not _COOKIE_NAME_RE.match(key):
                     invalid_names.append(key)
                 else:
-                    if (morsel := _create_morsel(key, value)) is not None:
-                        cookies.append((key, morsel))
+                    if (
+                        created_morsel := _create_morsel(key, value)
+                    ) is not None:
+                        cookies.append((key, created_morsel))
 
             # Move to next cookie or end
             i = next_semi + 1 if next_semi != -1 else n
@@ -239,8 +241,8 @@ def parse_cookie_header(header: str) -> List[Tuple[str, Morsel[str]]]:
             invalid_names.append(key)
             continue
 
-        if (morsel := _create_morsel(key, value)) is not None:
-            cookies.append((key, morsel))
+        if (created_morsel := _create_morsel(key, value)) is not None:
+            cookies.append((key, created_morsel))
 
     if invalid_names:
         internal_logger.debug(

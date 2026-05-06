@@ -3,7 +3,7 @@
 import asyncio
 import sys
 from types import TracebackType
-from typing import Any, Optional, Type, cast
+from typing import TYPE_CHECKING, Any, Optional, Type, cast
 
 import attr
 
@@ -27,6 +27,9 @@ from .typedefs import (
     JSONDecoder,
     JSONEncoder,
 )
+
+if TYPE_CHECKING:
+    from .connector import Connection
 
 if sys.version_info >= (3, 11):
     import asyncio as async_timeout
@@ -60,7 +63,7 @@ class ClientWebSocketResponse:
         client_notakeover: bool = False,
     ) -> None:
         self._response = response
-        self._conn = response.connection
+        self._conn = cast(Optional["Connection"], response.connection)
 
         self._writer = writer
         self._reader = reader
@@ -219,7 +222,7 @@ class ClientWebSocketResponse:
         conn = self._response.connection
         if conn is None:
             return default
-        transport = conn.transport
+        transport = cast("Connection", conn).transport
         if transport is None:
             return default
         return transport.get_extra_info(name, default)
