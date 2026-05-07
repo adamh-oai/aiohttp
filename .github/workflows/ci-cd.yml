@@ -215,7 +215,9 @@ jobs:
       env:
         COLOR: yes
         AIOHTTP_NO_EXTENSIONS: ${{ matrix.no-extensions }}
+        PIP_USER: 1
       run: >-  # `exit 1` makes sure that the job remains red with flaky runs
+        PATH="${HOME}/Library/Python/3.11/bin:${HOME}/.local/bin:${PATH}"
         pytest --no-cov --numprocesses=0 -vvvvv --lf && exit 1
       shell: bash
     - name: Run dev_mode tests

@@ -7,11 +7,12 @@ from pathlib import Path
 
 
 DIST_VERSION_RE = re.compile(
-    r'^(?P<prefix>__dist_version__\s*=\s*f"\{__version__\}\+native)'
+    r'^(?P<prefix>__dist_version__\s*=\s*"(?P<base_version>[^"]+)\+native)'
     r"(?P<number>\d+)"
     r'(?P<suffix>")$',
     re.MULTILINE,
 )
+VERSION_RE = re.compile(r'^__version__\s*=\s*"(?P<version>[^"]+)"$', re.MULTILINE)
 
 
 def run(*args: str, cwd: Path) -> None:
@@ -20,24 +21,25 @@ def run(*args: str, cwd: Path) -> None:
 
 def bump_dist_version(init_path: Path) -> str:
     init_text = init_path.read_text()
+    version_match = VERSION_RE.search(init_text)
+    if version_match is None:
+        raise RuntimeError(f"could not find __version__ assignment in {init_path}")
+
     match = DIST_VERSION_RE.search(init_text)
     if match is None:
         raise RuntimeError(
-            f"could not find derived __dist_version__ assignment in {init_path}"
+            f"could not find literal __dist_version__ assignment in {init_path}"
         )
 
+    base_version = version_match.group("version")
     next_number = int(match.group("number")) + 1
     next_text = DIST_VERSION_RE.sub(
-        rf"\g<prefix>{next_number}\g<suffix>",
+        f'__dist_version__ = "{base_version}+native{next_number}"',
         init_text,
         count=1,
     )
     init_path.write_text(next_text)
-
-    version_match = re.search(r'^__version__\s*=\s*"([^"]+)"$', init_text, re.MULTILINE)
-    if version_match is None:
-        raise RuntimeError(f"could not find __version__ assignment in {init_path}")
-    return f"{version_match.group(1)}+native{next_number}"
+    return f"{base_version}+native{next_number}"
 
 
 def main() -> None:
