@@ -79,7 +79,7 @@ license-files = [
 ]
 
 [tool.setuptools.dynamic]
-version = {attr = "aiohttp.__version__"}
+version = {attr = "aiohttp.__dist_version__"}
 
 [tool.setuptools.packages.find]
 include = [
