@@ -353,8 +353,10 @@ jobs:
           archs: aarch64
         - os: macos-15-intel
           archs: x86_64
+          macos_deployment_target: '10.12'
         - os: macos-14
           archs: arm64
+          macos_deployment_target: '11.0'
     steps:
     - name: Checkout
       uses: actions/checkout@v5
@@ -388,6 +390,8 @@ jobs:
         CIBW_SKIP: pp* *musllinux*
         CIBW_ARCHS_LINUX: ${{ matrix.archs }}
         CIBW_ARCHS_MACOS: ${{ matrix.archs }}
+        CIBW_ENVIRONMENT_MACOS: >-
+          MACOSX_DEPLOYMENT_TARGET=${{ matrix.macos_deployment_target }}
         CIBW_BEFORE_ALL_LINUX: >-
           curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs
           -o /tmp/rustup-init.sh &&
