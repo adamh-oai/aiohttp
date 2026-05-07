@@ -715,6 +715,7 @@ async def test_prepare_for_send(make_request: _RequestMaker) -> None:
     assert prepared.headers["CONTENT-TYPE"] == "application/octet-stream"
     assert prepared.content_length == len(b"payload")
     assert prepared.body is req.body
+    assert prepared.buffered_body == b"payload"
     assert prepared.upload_plan.kind is UploadKind.BUFFERED
     assert prepared.upload_plan.size == len(b"payload")
     assert prepared.upload_plan.replayability is UploadReplayability.REPLAYABLE
@@ -763,6 +764,7 @@ async def test_prepare_for_send_empty_body(make_request: _RequestMaker) -> None:
 
     prepared = req.prepare_for_send(force_close=False)
 
+    assert prepared.buffered_body == b""
     assert prepared.upload_plan.kind is UploadKind.EMPTY
     assert prepared.upload_plan.size == 0
     assert prepared.upload_plan.replayability is UploadReplayability.REPLAYABLE
@@ -780,6 +782,7 @@ async def test_prepare_for_send_async_iterable_body(
 
     prepared = req.prepare_for_send(force_close=False)
 
+    assert prepared.buffered_body is None
     assert prepared.upload_plan.kind is UploadKind.ASYNC_ITERABLE
     assert prepared.upload_plan.size is None
     assert prepared.upload_plan.replayability is UploadReplayability.ONE_SHOT
@@ -798,6 +801,7 @@ async def test_prepare_for_send_seekable_file_body(
 
     prepared = req.prepare_for_send(force_close=False)
 
+    assert prepared.buffered_body is None
     assert prepared.upload_plan.kind is UploadKind.FILE
     assert prepared.upload_plan.size == len(b"payload")
     assert prepared.upload_plan.replayability is UploadReplayability.REPLAYABLE

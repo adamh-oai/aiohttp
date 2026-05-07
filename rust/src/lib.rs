@@ -1,6 +1,7 @@
+use std::collections::VecDeque;
 use std::io::{self, Write};
 use std::pin::Pin;
-use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
 use std::sync::Arc;
 use std::task::{Context, Poll};
 use std::time::Duration;
@@ -10,6 +11,7 @@ use bytes::Bytes;
 use flate2::write::{DeflateDecoder, MultiGzDecoder, ZlibDecoder};
 use flate2::write::{GzEncoder, ZlibEncoder};
 use flate2::Compression;
+use futures_util::FutureExt;
 use http_body::{Body, Frame, SizeHint};
 use http_body_util::BodyExt;
 use hyper::client::conn::http1;
@@ -20,6 +22,7 @@ use pyo3::exceptions::{PyOSError, PyRuntimeError, PyTimeoutError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::PyBytes;
 use pyo3::types::PyType;
+use pyo3::IntoPyObjectExt;
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
 use rustls::crypto::{verify_tls12_signature, verify_tls13_signature, WebPkiSupportedAlgorithms};
 use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
@@ -40,7 +43,8 @@ type NativeResponse = (
     u16,
     String,
     RawHeaders,
-    Py<ResponseBody>,
+    Py<PyAny>,
+    Py<NativeConnection>,
     bool,
     Option<String>,
     bool,
@@ -230,6 +234,9 @@ impl ResponseDecoder {
 const BODY_WAITING: u8 = 0;
 const BODY_CONTINUE: u8 = 1;
 const BODY_SKIP: u8 = 2;
+const BODY_EVENT_PENDING: u8 = 0;
+const BODY_EVENT_CHUNK: u8 = 1;
+const BODY_EVENT_EOF: u8 = 2;
 
 struct RequestBodyGate {
     state: AtomicU8,
@@ -332,85 +339,82 @@ impl NativeConnection {
 
 #[pyclass]
 struct ResponseBody {
-    body: Option<hyper::body::Incoming>,
+    receiver: Option<mpsc::UnboundedReceiver<PyResult<Option<Vec<u8>>>>>,
     locals: pyo3_async_runtimes::TaskLocals,
-    read_timeout: Option<Duration>,
-    decoder: Option<ResponseDecoder>,
-    total_raw_bytes: u64,
+    total_raw_bytes: Arc<AtomicU64>,
+    abort_handle: AbortHandle,
 }
 
 #[pymethods]
 impl ResponseBody {
     #[getter]
     fn total_raw_bytes(&self) -> u64 {
-        self.total_raw_bytes
+        self.total_raw_bytes.load(Ordering::Relaxed)
     }
 
-    fn next_chunk<'py>(slf: Py<Self>, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+    fn try_next_chunk(&mut self) -> PyResult<(u8, Option<Vec<u8>>)> {
+        let Some(receiver) = self.receiver.as_mut() else {
+            return Ok((BODY_EVENT_EOF, None));
+        };
+        match receiver.try_recv() {
+            Ok(Ok(Some(chunk))) => Ok((BODY_EVENT_CHUNK, Some(chunk))),
+            Ok(Ok(None)) => {
+                self.receiver = None;
+                Ok((BODY_EVENT_EOF, None))
+            }
+            Ok(Err(error)) => {
+                self.receiver = None;
+                Err(error)
+            }
+            Err(mpsc::error::TryRecvError::Empty) => Ok((BODY_EVENT_PENDING, None)),
+            Err(mpsc::error::TryRecvError::Disconnected) => {
+                self.receiver = None;
+                Ok((BODY_EVENT_EOF, None))
+            }
+        }
+    }
+
+    fn start_next_chunk(slf: Py<Self>, py: Python<'_>, completion: Py<PyAny>) -> PyResult<()> {
         let locals = slf.borrow(py).locals.clone();
-        pyo3_async_runtimes::tokio::future_into_py_with_locals(
-            py,
-            locals.clone(),
-            pyo3_async_runtimes::tokio::scope(locals, async move {
-                let (body, read_timeout, mut decoder) = Python::attach(|py| {
-                    let mut body = slf.borrow_mut(py);
-                    (body.body.take(), body.read_timeout, body.decoder.take())
-                });
-                let Some(mut body) = body else {
+        let receiver = slf.borrow_mut(py).receiver.take();
+        pyo3_async_runtimes::tokio::get_runtime().spawn(async move {
+            let result = pyo3_async_runtimes::tokio::scope(locals.clone(), async move {
+                let Some(mut receiver) = receiver else {
                     return Ok(None);
                 };
-                loop {
-                    let frame = if let Some(read_timeout) = read_timeout {
-                        timeout(read_timeout, body.frame())
-                            .await
-                            .map_err(|_| read_timeout_error())?
-                    } else {
-                        body.frame().await
-                    };
-                    let Some(frame) = frame else {
-                        let chunk = match decoder.take() {
-                            Some(decoder) => {
-                                let encoding = decoder.encoding.clone();
-                                decoder
-                                    .finish()
-                                    .map_err(|error| response_decode_error(&encoding, error))?
-                            }
-                            None => Vec::new(),
-                        };
-                        if chunk.is_empty() {
-                            return Ok(None);
-                        }
-                        return Ok(Some(chunk));
-                    };
-                    let frame = frame.map_err(hyper_error)?;
-                    if let Ok(data) = frame.into_data() {
-                        let raw_chunk = data.to_vec();
-                        Python::attach(|py| {
-                            slf.borrow_mut(py).total_raw_bytes += raw_chunk.len() as u64
-                        });
-                        let chunk = match decoder.as_mut() {
-                            Some(decoder) => decoder
-                                .decode_chunk(&raw_chunk)
-                                .map_err(|error| response_decode_error(&decoder.encoding, error))?,
-                            None => raw_chunk,
-                        };
-                        if !chunk.is_empty() {
-                            Python::attach(|py| {
-                                let mut response_body = slf.borrow_mut(py);
-                                response_body.body = Some(body);
-                                response_body.decoder = decoder;
-                            });
-                            return Ok(Some(chunk));
-                        }
-                    }
+                let event = receiver.recv().await;
+                let keep_receiver = matches!(&event, Some(Ok(Some(_))));
+                Python::attach(|py| {
+                    slf.borrow_mut(py).receiver = keep_receiver.then_some(receiver);
+                });
+                match event {
+                    Some(Ok(Some(chunk))) => Ok(Some(chunk)),
+                    Some(Ok(None)) | None => Ok(None),
+                    Some(Err(error)) => Err(error),
                 }
-            }),
-        )
+            })
+            .await;
+            let completion_result = Python::attach(move |py| {
+                let completion = completion.bind(py);
+                let callback = completion.getattr("_complete_from_rust")?;
+                let event_loop = locals.event_loop(py);
+                let (result, exception) = match result {
+                    Ok(result) => (result.into_py_any(py)?, py.None()),
+                    Err(error) => (py.None(), error.into_value(py).into_any()),
+                };
+                event_loop.call_method1("call_soon_threadsafe", (callback, result, exception))?;
+                Ok::<(), PyErr>(())
+            });
+            if let Err(error) = completion_result {
+                Python::attach(|py| error.print(py));
+            }
+        });
+        Ok(())
     }
 
     fn close(&mut self) {
-        self.body = None;
-        self.decoder = None;
+        self.receiver = None;
+        self.abort_handle.abort();
     }
 }
 
@@ -644,12 +648,20 @@ fn tls_client_config(verify_tls: bool) -> PyResult<Arc<ClientConfig>> {
 #[pyfunction]
 #[pyo3(signature = (
     connection,
+    host,
+    port,
+    connect_max_headers,
+    sock_connect,
+    use_tls,
+    verify_tls,
+    tls_server_name,
     method,
     target,
     version_major,
     version_minor,
     headers,
     upload_cursor,
+    buffered_body,
     content_length,
     compression,
     expect_continue,
@@ -662,13 +674,21 @@ fn tls_client_config(verify_tls: bool) -> PyResult<Arc<ClientConfig>> {
 #[allow(clippy::too_many_arguments)]
 fn send_http1_request<'py>(
     py: Python<'py>,
-    connection: Py<NativeConnection>,
+    connection: Option<Py<NativeConnection>>,
+    host: String,
+    port: u16,
+    connect_max_headers: usize,
+    sock_connect: Option<f64>,
+    use_tls: bool,
+    verify_tls: bool,
+    tls_server_name: Option<String>,
     method: String,
     target: String,
     version_major: u8,
     version_minor: u8,
     headers: Vec<(String, String)>,
-    upload_cursor: Py<PyAny>,
+    upload_cursor: Option<Py<PyAny>>,
+    buffered_body: Option<Vec<u8>>,
     content_length: Option<u64>,
     compression: Option<String>,
     expect_continue: bool,
@@ -685,12 +705,20 @@ fn send_http1_request<'py>(
         pyo3_async_runtimes::tokio::scope(locals.clone(), async move {
             send_http1_request_impl(
                 connection,
+                &host,
+                port,
+                connect_max_headers,
+                sock_connect,
+                use_tls,
+                verify_tls,
+                tls_server_name.as_deref(),
                 &method,
                 &target,
                 version_major,
                 version_minor,
                 headers,
                 upload_cursor,
+                buffered_body,
                 content_length,
                 compression,
                 expect_continue,
@@ -706,15 +734,128 @@ fn send_http1_request<'py>(
     )
 }
 
+#[pyfunction]
+#[pyo3(signature = (
+    completion,
+    connection,
+    host,
+    port,
+    connect_max_headers,
+    sock_connect,
+    use_tls,
+    verify_tls,
+    tls_server_name,
+    method,
+    target,
+    version_major,
+    version_minor,
+    headers,
+    upload_cursor,
+    buffered_body,
+    content_length,
+    compression,
+    expect_continue,
+    read_until_eof,
+    auto_decompress,
+    skip_payload,
+    max_headers,
+    sock_read,
+))]
+fn start_http1_request(
+    py: Python<'_>,
+    completion: Py<PyAny>,
+    connection: Option<Py<NativeConnection>>,
+    host: String,
+    port: u16,
+    connect_max_headers: usize,
+    sock_connect: Option<f64>,
+    use_tls: bool,
+    verify_tls: bool,
+    tls_server_name: Option<String>,
+    method: String,
+    target: String,
+    version_major: u8,
+    version_minor: u8,
+    headers: Vec<(String, String)>,
+    upload_cursor: Option<Py<PyAny>>,
+    buffered_body: Option<Vec<u8>>,
+    content_length: Option<u64>,
+    compression: Option<String>,
+    expect_continue: bool,
+    read_until_eof: bool,
+    auto_decompress: bool,
+    skip_payload: bool,
+    max_headers: usize,
+    sock_read: Option<f64>,
+) -> PyResult<()> {
+    let locals = pyo3_async_runtimes::tokio::get_current_locals(py)?;
+    pyo3_async_runtimes::tokio::get_runtime().spawn(async move {
+        let request_locals = locals.clone();
+        let result = pyo3_async_runtimes::tokio::scope(locals.clone(), async move {
+            send_http1_request_impl(
+                connection,
+                &host,
+                port,
+                connect_max_headers,
+                sock_connect,
+                use_tls,
+                verify_tls,
+                tls_server_name.as_deref(),
+                &method,
+                &target,
+                version_major,
+                version_minor,
+                headers,
+                upload_cursor,
+                buffered_body,
+                content_length,
+                compression,
+                expect_continue,
+                read_until_eof,
+                auto_decompress,
+                skip_payload,
+                max_headers,
+                sock_read,
+                request_locals,
+            )
+            .await
+        })
+        .await;
+        let completion_result = Python::attach(move |py| {
+            let completion = completion.bind(py);
+            let callback = completion.getattr("_complete_from_rust")?;
+            let event_loop = locals.event_loop(py);
+            let (result, exception) = match result {
+                Ok(result) => (result.into_py_any(py)?, py.None()),
+                Err(error) => (py.None(), error.into_value(py).into_any()),
+            };
+            event_loop.call_method1("call_soon_threadsafe", (callback, result, exception))?;
+            Ok::<(), PyErr>(())
+        });
+        if let Err(error) = completion_result {
+            Python::attach(|py| error.print(py));
+        }
+    });
+    Ok(())
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn send_http1_request_impl(
-    connection: Py<NativeConnection>,
+    connection: Option<Py<NativeConnection>>,
+    host: &str,
+    port: u16,
+    connect_max_headers: usize,
+    sock_connect: Option<f64>,
+    use_tls: bool,
+    verify_tls: bool,
+    tls_server_name: Option<&str>,
     method: &str,
     target: &str,
     version_major: u8,
     version_minor: u8,
     headers: Vec<(String, String)>,
-    upload_cursor: Py<PyAny>,
+    upload_cursor: Option<Py<PyAny>>,
+    buffered_body: Option<Vec<u8>>,
     content_length: Option<u64>,
     compression: Option<String>,
     expect_continue: bool,
@@ -728,6 +869,21 @@ async fn send_http1_request_impl(
     if max_headers == 0 {
         return Err(PyValueError::new_err("max_headers must be positive"));
     }
+    let connection = match connection {
+        Some(connection) => connection,
+        None => {
+            open_http1_connection_impl(
+                host,
+                port,
+                connect_max_headers,
+                sock_connect,
+                use_tls,
+                verify_tls,
+                tls_server_name,
+            )
+            .await?
+        }
+    };
     let (sender, closed) = Python::attach(|py| {
         let connection = connection.borrow(py);
         (connection.sender.clone(), connection.closed.clone())
@@ -737,16 +893,24 @@ async fn send_http1_request_impl(
     }
 
     let read_timeout = timeout_duration(sock_read)?;
-    let compressor = RequestCompressor::new(compression.as_deref())?;
     let body_gate = RequestBodyGate::new(expect_continue);
-    let (body, body_driver, body_done) = make_request_body(
-        upload_cursor,
-        content_length,
-        compressor,
-        locals.clone(),
-        body_gate.clone(),
-    );
-    tokio::spawn(body_driver);
+    let (body, body_done) = if let Some(buffered_body) = buffered_body {
+        make_buffered_request_body(buffered_body, content_length)
+    } else {
+        let compressor = RequestCompressor::new(compression.as_deref())?;
+        let upload_cursor = upload_cursor.ok_or_else(|| {
+            PyRuntimeError::new_err("streaming request body is missing upload cursor")
+        })?;
+        let (body, body_driver, body_done) = make_request_body(
+            upload_cursor,
+            content_length,
+            compressor,
+            locals.clone(),
+            body_gate.clone(),
+        );
+        tokio::spawn(body_driver);
+        (body, body_done)
+    };
     let mut request = build_request(method, target, version_major, version_minor, headers, body)?;
     if expect_continue {
         let informational_gate = body_gate.clone();
@@ -809,18 +973,8 @@ async fn send_http1_request_impl(
     } else {
         None
     };
-    let body = Python::attach(|py| {
-        Py::new(
-            py,
-            ResponseBody {
-                body,
-                locals: locals.clone(),
-                read_timeout,
-                decoder,
-                total_raw_bytes: 0,
-            },
-        )
-    })?;
+    let body =
+        Python::attach(|py| make_response_body(py, body, locals.clone(), read_timeout, decoder))?;
 
     Ok((
         version_minor,
@@ -832,11 +986,165 @@ async fn send_http1_request_impl(
             .to_owned(),
         raw_headers,
         body,
+        connection,
         should_close,
         compression,
         upgrade,
         chunked,
     ))
+}
+
+fn make_response_body(
+    py: Python<'_>,
+    body: Option<hyper::body::Incoming>,
+    locals: pyo3_async_runtimes::TaskLocals,
+    read_timeout: Option<Duration>,
+    decoder: Option<ResponseDecoder>,
+) -> PyResult<Py<PyAny>> {
+    let Some(mut body) = body else {
+        return Ok(PyBytes::new(py, b"").unbind().into_any());
+    };
+    if decoder.is_some() {
+        return make_streaming_response_body(
+            py,
+            body,
+            locals,
+            read_timeout,
+            decoder,
+            VecDeque::new(),
+            0,
+        );
+    }
+
+    let mut raw_chunks = Vec::new();
+    let mut pending_chunks = VecDeque::new();
+    let mut total_raw_bytes = 0;
+    loop {
+        let Some(frame) = body.frame().now_or_never() else {
+            pending_chunks.extend(raw_chunks);
+            return make_streaming_response_body(
+                py,
+                body,
+                locals,
+                read_timeout,
+                None,
+                pending_chunks,
+                total_raw_bytes,
+            );
+        };
+        let Some(frame) = frame else {
+            return Ok(PyBytes::new(py, &raw_chunks.concat()).unbind().into_any());
+        };
+        let frame = frame.map_err(hyper_error)?;
+        if let Ok(data) = frame.into_data() {
+            let raw_chunk = data.to_vec();
+            total_raw_bytes += raw_chunk.len() as u64;
+            raw_chunks.push(raw_chunk);
+        }
+    }
+}
+
+fn make_streaming_response_body(
+    py: Python<'_>,
+    body: hyper::body::Incoming,
+    locals: pyo3_async_runtimes::TaskLocals,
+    read_timeout: Option<Duration>,
+    decoder: Option<ResponseDecoder>,
+    pending_chunks: VecDeque<Vec<u8>>,
+    initial_total_raw_bytes: u64,
+) -> PyResult<Py<PyAny>> {
+    let (sender, receiver) = mpsc::unbounded_channel();
+    for chunk in pending_chunks {
+        if sender.send(Ok(Some(chunk))).is_err() {
+            break;
+        }
+    }
+    let total_raw_bytes = Arc::new(AtomicU64::new(initial_total_raw_bytes));
+    let producer_total_raw_bytes = total_raw_bytes.clone();
+    let producer = tokio::spawn(drive_response_body(
+        body,
+        read_timeout,
+        decoder,
+        sender,
+        producer_total_raw_bytes,
+    ));
+    let abort_handle = producer.abort_handle();
+    let response_body = Py::new(
+        py,
+        ResponseBody {
+            receiver: Some(receiver),
+            locals,
+            total_raw_bytes,
+            abort_handle,
+        },
+    )?;
+    Ok(response_body.into_any())
+}
+
+async fn drive_response_body(
+    mut body: hyper::body::Incoming,
+    read_timeout: Option<Duration>,
+    mut decoder: Option<ResponseDecoder>,
+    sender: mpsc::UnboundedSender<PyResult<Option<Vec<u8>>>>,
+    total_raw_bytes: Arc<AtomicU64>,
+) {
+    loop {
+        let frame = if let Some(read_timeout) = read_timeout {
+            match timeout(read_timeout, body.frame()).await {
+                Ok(frame) => frame,
+                Err(_) => {
+                    let _ = sender.send(Err(read_timeout_error()));
+                    return;
+                }
+            }
+        } else {
+            body.frame().await
+        };
+        let Some(frame) = frame else {
+            let chunk = match decoder.take() {
+                Some(decoder) => {
+                    let encoding = decoder.encoding.clone();
+                    match decoder.finish() {
+                        Ok(chunk) => chunk,
+                        Err(error) => {
+                            let _ = sender.send(Err(response_decode_error(&encoding, error)));
+                            return;
+                        }
+                    }
+                }
+                None => Vec::new(),
+            };
+            if !chunk.is_empty() && sender.send(Ok(Some(chunk))).is_err() {
+                return;
+            }
+            let _ = sender.send(Ok(None));
+            return;
+        };
+        let frame = match frame {
+            Ok(frame) => frame,
+            Err(error) => {
+                let _ = sender.send(Err(hyper_error(error)));
+                return;
+            }
+        };
+        if let Ok(data) = frame.into_data() {
+            let raw_chunk = data.to_vec();
+            total_raw_bytes.fetch_add(raw_chunk.len() as u64, Ordering::Relaxed);
+            let chunk = match decoder.as_mut() {
+                Some(decoder) => match decoder.decode_chunk(&raw_chunk) {
+                    Ok(chunk) => chunk,
+                    Err(error) => {
+                        let _ = sender.send(Err(response_decode_error(&decoder.encoding, error)));
+                        return;
+                    }
+                },
+                None => raw_chunk,
+            };
+            if !chunk.is_empty() && sender.send(Ok(Some(chunk))).is_err() {
+                return;
+            }
+        }
+    }
 }
 
 fn build_request(
@@ -960,6 +1268,34 @@ fn make_request_body(
         let _ = done_sender.send(());
     };
     (body, driver, done_receiver)
+}
+
+fn make_buffered_request_body(
+    body_bytes: Vec<u8>,
+    content_length: Option<u64>,
+) -> (ChannelBody, oneshot::Receiver<()>) {
+    let (sender, receiver) = mpsc::channel(1);
+    let mut size_hint = SizeHint::new();
+    if let Some(length) = content_length {
+        size_hint.set_exact(length);
+    } else {
+        size_hint.set_exact(body_bytes.len() as u64);
+    }
+    if !body_bytes.is_empty() {
+        sender
+            .try_send(Ok(Bytes::from(body_bytes)))
+            .expect("fresh buffered request channel must have capacity");
+    }
+    drop(sender);
+    let (done_sender, done_receiver) = oneshot::channel();
+    let _ = done_sender.send(());
+    (
+        ChannelBody {
+            receiver,
+            size_hint,
+        },
+        done_receiver,
+    )
 }
 
 async fn wait_for_response_headers<F>(
@@ -1154,6 +1490,7 @@ fn _rust_client(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(is_available, module)?)?;
     module.add_function(wrap_pyfunction!(open_http1_connection, module)?)?;
     module.add_function(wrap_pyfunction!(send_http1_request, module)?)?;
+    module.add_function(wrap_pyfunction!(start_http1_request, module)?)?;
     Ok(())
 }
 

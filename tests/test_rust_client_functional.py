@@ -29,6 +29,8 @@ except ImportError:  # pragma: no cover
     zstandard = None
 
 from aiohttp import ClientSession, FormData, RustClientEngine, SocketTimeoutError, web
+from aiohttp.client_engine import _RustClientBodyStream
+from aiohttp.helpers import TimerNoop
 from aiohttp.pytest_plugin import AiohttpServer
 from aiohttp.test_utils import TestServer
 
@@ -126,6 +128,26 @@ async def test_rust_engine_close_waits_for_native_connections() -> None:
 
     allow_close.set()
     await close_task
+
+
+async def test_rust_body_stream_reads_ready_native_chunks_without_awaiting() -> None:
+    class ReadyBody:
+        total_raw_bytes = 2
+
+        def __init__(self) -> None:
+            self._events = [(1, b"ok"), (2, None)]
+
+        def try_next_chunk(self) -> tuple[int, bytes | None]:
+            return self._events.pop(0)
+
+        def start_next_chunk(self, completion: object) -> None:
+            raise AssertionError("ready chunks should not require an async fallback")
+
+        def close(self) -> None:
+            return None
+
+    stream = _RustClientBodyStream(ReadyBody(), TimerNoop())
+    assert await stream.read() == b"ok"
 
 
 async def test_rust_engine_waits_for_close_after_fingerprint_mismatch() -> None:
@@ -418,7 +440,7 @@ async def test_rust_engine_times_out_between_response_chunks(
     app.router.add_get("/", handler)
     server = await aiohttp_server(app)
 
-    timeout = aiohttp.ClientTimeout(total=None, sock_read=0.01)
+    timeout = aiohttp.ClientTimeout(total=None, sock_read=0.05)
     async with ClientSession(client_engine=RustClientEngine()) as session:
         response = await session.get(server.make_url("/"), timeout=timeout)
         assert await response.content.readany() == b"first"

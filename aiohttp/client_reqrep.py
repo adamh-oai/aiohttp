@@ -854,6 +854,7 @@ class PreparedClientRequest:
     headers: CIMultiDict[str]
     content_length: Optional[int]
     body: payload.Payload
+    buffered_body: bytes | None
     upload_source: UploadSource
     upload_plan: UploadPlan
     chunked: Optional[bool]
@@ -1046,6 +1047,7 @@ class ClientRequest:
             headers=self.headers,
             content_length=content_length,
             body=body,
+            buffered_body=self._buffered_body_for_engine(body, content_length),
             upload_source=PayloadUploadSource(body, content_length),
             upload_plan=self._build_upload_plan(body),
             chunked=self.chunked,
@@ -1053,6 +1055,18 @@ class ClientRequest:
             expect_continue=self._continue is not None,
             auto_headers=self._auto_headers,
         )
+
+    def _buffered_body_for_engine(
+        self, body: payload.Payload, content_length: Optional[int]
+    ) -> bytes | None:
+        if self._body is None:
+            return b""
+        if not isinstance(body, payload.BytesPayload):
+            return None
+        value = bytes(body._value)
+        if content_length is not None:
+            return value[:content_length]
+        return value
 
     def _build_upload_plan(self, body: payload.Payload) -> UploadPlan:
         if self._body is None:

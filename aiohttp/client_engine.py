@@ -6,7 +6,7 @@ import ssl
 from collections.abc import AsyncIterator, Awaitable, Callable
 from enum import Enum
 from hashlib import sha256
-from typing import TYPE_CHECKING, NoReturn, Optional, Protocol, cast
+from typing import TYPE_CHECKING, Any, NoReturn, Optional, Protocol, cast
 
 import attr
 from multidict import CIMultiDict, CIMultiDictProxy
@@ -61,6 +61,9 @@ __all__ = (
 
 DEFAULT_NATIVE_READ_BUFSIZE = 2**16
 _NATIVE_TIMEOUT_ERRORS = (asyncio.TimeoutError, TimeoutError)
+_NATIVE_BODY_PENDING = 0
+_NATIVE_BODY_CHUNK = 1
+_NATIVE_BODY_EOF = 2
 
 
 class UploadKind(Enum):
@@ -295,7 +298,9 @@ class _NativeBody(Protocol):
     @property
     def total_raw_bytes(self) -> int: ...
 
-    async def next_chunk(self) -> bytes | None: ...
+    def try_next_chunk(self) -> tuple[int, bytes | None]: ...
+
+    def start_next_chunk(self, completion: "_NativeCompletion") -> None: ...
 
     def close(self) -> None: ...
 
@@ -316,7 +321,8 @@ NativeResponse = tuple[
     int,
     str,
     list[tuple[bytes, bytes]],
-    _NativeBody,
+    bytes | _NativeBody,
+    _NativeConnection,
     bool,
     Optional[str],
     bool,
@@ -338,13 +344,21 @@ class _RustClientModule(Protocol):
 
     async def send_http1_request(
         self,
-        connection: _NativeConnection,
+        connection: _NativeConnection | None,
+        host: str,
+        port: int,
+        connect_max_headers: int,
+        sock_connect: float | None,
+        tls: bool,
+        verify_tls: bool,
+        tls_server_name: str | None,
         method: str,
         target: str,
         version_major: int,
         version_minor: int,
         headers: list[tuple[str, str]],
-        upload_cursor: "_UploadCursor",
+        upload_cursor: "_UploadCursor | None",
+        buffered_body: bytes | None,
         content_length: int | None,
         compression: str | None,
         expect_continue: bool,
@@ -354,6 +368,34 @@ class _RustClientModule(Protocol):
         max_headers: int,
         sock_read: float | None,
     ) -> NativeResponse: ...
+
+    def start_http1_request(
+        self,
+        completion: "_NativeCompletion",
+        connection: _NativeConnection | None,
+        host: str,
+        port: int,
+        connect_max_headers: int,
+        sock_connect: float | None,
+        tls: bool,
+        verify_tls: bool,
+        tls_server_name: str | None,
+        method: str,
+        target: str,
+        version_major: int,
+        version_minor: int,
+        headers: list[tuple[str, str]],
+        upload_cursor: "_UploadCursor | None",
+        buffered_body: bytes | None,
+        content_length: int | None,
+        compression: str | None,
+        expect_continue: bool,
+        read_until_eof: bool,
+        auto_decompress: bool,
+        skip_payload: bool,
+        max_headers: int,
+        sock_read: float | None,
+    ) -> None: ...
 
 
 class ClientExchange(Protocol):
@@ -371,6 +413,126 @@ class ClientExchange(Protocol):
 
     def close(self) -> None: ...
 
+
+class _NativeCompletion:
+    _asyncio_future_blocking = False
+
+    def __init__(self, loop: asyncio.AbstractEventLoop) -> None:
+        self._loop = loop
+        self._done = False
+        self._cancelled = False
+        self._result: Any = None
+        self._exception: BaseException | None = None
+        self._callbacks: list[tuple[Callable[["_NativeCompletion"], None], Any]] = []
+
+    def __await__(self) -> Any:
+        if not self._done:
+            self._asyncio_future_blocking = True
+            yield self
+        if not self._done:
+            raise RuntimeError("await was not used with future")
+        return self.result()
+
+    __iter__ = __await__
+
+    def get_loop(self) -> asyncio.AbstractEventLoop:
+        return self._loop
+
+    def done(self) -> bool:
+        return self._done
+
+    def cancelled(self) -> bool:
+        return self._cancelled
+
+    def cancel(self, msg: object = None) -> bool:
+        if self._done:
+            return False
+        self._done = True
+        self._cancelled = True
+        self._exception = asyncio.CancelledError(msg)
+        self._schedule_callbacks()
+        return True
+
+    def result(self) -> Any:
+        if not self._done:
+            raise asyncio.InvalidStateError("Result is not ready.")
+        if self._cancelled:
+            raise asyncio.CancelledError
+        if self._exception is not None:
+            raise self._exception
+        assert self._result is not None
+        return self._result
+
+    def exception(self) -> BaseException | None:
+        if not self._done:
+            raise asyncio.InvalidStateError("Exception is not set.")
+        if self._cancelled:
+            raise asyncio.CancelledError
+        return self._exception
+
+    def add_done_callback(
+        self,
+        callback: Callable[["_NativeCompletion"], None],
+        *,
+        context: Any = None,
+    ) -> None:
+        if self._done:
+            if self._cancelled:
+                self._schedule_callback(callback, context)
+            else:
+                self._run_callback(callback, context)
+            return
+        self._callbacks.append((callback, context))
+
+    def remove_done_callback(
+        self, callback: Callable[["_NativeCompletion"], None]
+    ) -> int:
+        before = len(self._callbacks)
+        self._callbacks = [
+            (registered, context)
+            for registered, context in self._callbacks
+            if registered != callback
+        ]
+        return before - len(self._callbacks)
+
+    def _complete_from_rust(
+        self, result: Any, exception: BaseException | None
+    ) -> None:
+        if self._done:
+            return
+        self._done = True
+        self._result = result
+        self._exception = exception
+        self._run_callbacks()
+
+    def _run_callbacks(self) -> None:
+        callbacks = self._callbacks
+        self._callbacks = []
+        for callback, context in callbacks:
+            self._run_callback(callback, context)
+
+    def _schedule_callbacks(self) -> None:
+        callbacks = self._callbacks
+        self._callbacks = []
+        for callback, context in callbacks:
+            self._schedule_callback(callback, context)
+
+    def _run_callback(
+        self,
+        callback: Callable[["_NativeCompletion"], None],
+        context: Any,
+    ) -> None:
+        if context is None:
+            callback(self)
+        else:
+            context.run(callback, self)
+
+    def _schedule_callback(
+        self,
+        callback: Callable[["_NativeCompletion"], None],
+        context: Any,
+    ) -> None:
+        self._loop.call_soon(callback, self, context=context)
 
 class AsyncioClientExchange:
     __aiohttp_exchange__ = True
@@ -752,8 +914,16 @@ class _RustClientBodyStream:
     async def _read_next_chunk(self) -> None:
         self._raise_exception()
         try:
-            with self._timer:
-                chunk = await self._body.next_chunk()
+            body_state, chunk = self._body.try_next_chunk()
+            if body_state == _NATIVE_BODY_PENDING:
+                with self._timer:
+                    completion = _NativeCompletion(asyncio.get_running_loop())
+                    self._body.start_next_chunk(completion)
+                    chunk = await completion
+            elif body_state == _NATIVE_BODY_EOF:
+                chunk = None
+            elif body_state != _NATIVE_BODY_CHUNK:
+                raise RuntimeError(f"unknown native body state {body_state!r}")
         except _NATIVE_TIMEOUT_ERRORS as exc:
             error = SocketTimeoutError("Timeout on reading data from socket")
             self._exception = error
@@ -1199,6 +1369,11 @@ class RustClientEngine:
         self._validate_prepared(prepared)
         if hdrs.ACCEPT_ENCODING in prepared.auto_headers:
             prepared.headers[hdrs.ACCEPT_ENCODING] = "gzip, deflate, br, zstd"
+        native_buffered_body = (
+            prepared.buffered_body
+            if not prepared.expect_continue and prepared.compression is None
+            else None
+        )
         host = request.url.raw_host or ""
         tls_server_name = (
             (request.server_hostname or host).rstrip(".")
@@ -1215,14 +1390,23 @@ class RustClientEngine:
             tls_server_name,
             tls_fingerprint,
         )
-        native_connection = await self._acquire_connection(
-            connection_key,
-            request=request,
-            traces=traces,
-            sock_connect=options.timeout.sock_connect,
+        native_connection = self._take_available_connection(connection_key)
+        open_in_native_request = (
+            native_connection is None and tls_fingerprint is None
         )
-        await self._check_fingerprint(request, native_connection, tls_fingerprint)
+        if not open_in_native_request:
+            native_connection = await self._acquire_connection(
+                connection_key,
+                request=request,
+                traces=traces,
+                sock_connect=options.timeout.sock_connect,
+                available=native_connection,
+            )
+            await self._check_fingerprint(request, native_connection, tls_fingerprint)
         try:
+            if open_in_native_request:
+                for trace in traces:
+                    await trace.send_connection_create_start()
             if traces:
                 await request._on_headers_request_sent(
                     prepared.method,
@@ -1231,25 +1415,38 @@ class RustClientEngine:
                 )
             raw_response = await self._send_http1_request(
                 native_connection,
+                host,
+                request.url.port
+                or (443 if request.url.scheme == "https" else 80),
+                options.max_headers,
+                options.timeout.sock_connect,
+                request.url.scheme == "https",
+                request.url.scheme != "https" or request.ssl is True,
+                tls_server_name,
                 prepared.method,
                 prepared.target,
                 prepared.version.major,
                 prepared.version.minor,
                 list(prepared.headers.items()),
-                _UploadCursor(
-                    prepared.upload_source,
-                    on_chunk=(
-                        (
-                            lambda chunk: request._on_chunk_request_sent(
-                                prepared.method,
-                                request.url,
-                                chunk,
+                (
+                    None
+                    if native_buffered_body is not None
+                    else _UploadCursor(
+                        prepared.upload_source,
+                        on_chunk=(
+                            (
+                                lambda chunk: request._on_chunk_request_sent(
+                                    prepared.method,
+                                    request.url,
+                                    chunk,
+                                )
                             )
-                        )
-                        if traces
-                        else None
-                    ),
+                            if traces
+                            else None
+                        ),
+                    )
                 ),
+                buffered_body=native_buffered_body,
                 content_length=prepared.content_length,
                 compression=prepared.compression,
                 expect_continue=prepared.expect_continue,
@@ -1259,11 +1456,26 @@ class RustClientEngine:
                 max_headers=options.max_headers,
                 sock_read=options.timeout.sock_read,
             )
+        except cert_errors as exc:
+            if native_connection is not None:
+                self._close_connection(native_connection)
+            raise ClientConnectorCertificateError(request.connection_key, exc) from exc
+        except ssl_errors as exc:
+            if native_connection is not None:
+                self._close_connection(native_connection)
+            raise ClientConnectorSSLError(request.connection_key, exc) from exc
         except _NATIVE_TIMEOUT_ERRORS as exc:
-            self._close_connection(native_connection)
+            if native_connection is not None:
+                self._close_connection(native_connection)
+            if open_in_native_request and exc.args == ("Connection timeout",):
+                raise ConnectionTimeoutError(
+                    f"Connection timeout to host {connection_key[0]}://"
+                    f"{connection_key[1]}:{connection_key[2]}"
+                ) from exc
             raise SocketTimeoutError("Timeout on reading data from socket") from exc
         except HttpProcessingError as exc:
-            self._close_connection(native_connection)
+            if native_connection is not None:
+                self._close_connection(native_connection)
             response = request._create_response(None)
             raise ClientResponseError(
                 response.request_info,
@@ -1278,11 +1490,16 @@ class RustClientEngine:
             reason,
             raw_headers,
             response_body,
+            native_connection,
             should_close,
             compression,
             upgrade,
             chunked,
         ) = raw_response
+        if open_in_native_request:
+            self._connections.add(native_connection)
+            for trace in traces:
+                await trace.send_connection_create_end()
 
         headers = CIMultiDict[str]()
         for raw_name, raw_value in raw_headers:
@@ -1349,17 +1566,12 @@ class RustClientEngine:
         request: "ClientRequest",
         traces: list["Trace"],
         sock_connect: float | None,
+        available: _NativeConnection | None = None,
     ) -> _NativeConnection:
-        available = self._available_connections.get(key)
-        while available:
-            connection = available.pop()
-            if not connection.closed:
-                for trace in traces:
-                    await trace.send_connection_reuseconn()
-                return connection
-            self._connections.discard(connection)
-        if available == []:
-            self._available_connections.pop(key, None)
+        if available is not None:
+            for trace in traces:
+                await trace.send_connection_reuseconn()
+            return available
 
         try:
             for trace in traces:
@@ -1380,6 +1592,19 @@ class RustClientEngine:
             ) from exc
         self._connections.add(connection)
         return connection
+
+    def _take_available_connection(
+        self, key: NativeConnectionKey
+    ) -> _NativeConnection | None:
+        available = self._available_connections.get(key)
+        while available:
+            connection = available.pop()
+            if not connection.closed:
+                return connection
+            self._connections.discard(connection)
+        if available == []:
+            self._available_connections.pop(key, None)
+        return None
 
     def _release_connection(
         self,
@@ -1468,14 +1693,22 @@ class RustClientEngine:
 
     async def _send_http1_request(
         self,
-        connection: _NativeConnection,
+        connection: _NativeConnection | None,
+        host: str,
+        port: int,
+        connect_max_headers: int,
+        sock_connect: float | None,
+        tls: bool,
+        verify_tls: bool,
+        tls_server_name: str | None,
         method: str,
         target: str,
         version_major: int,
         version_minor: int,
         headers: list[tuple[str, str]],
-        upload_cursor: _UploadCursor,
+        upload_cursor: _UploadCursor | None,
         *,
+        buffered_body: bytes | None,
         content_length: int | None,
         compression: str | None,
         expect_continue: bool,
@@ -1493,14 +1726,24 @@ class RustClientEngine:
             ) from exc
 
         rust_client = cast(_RustClientModule, _rust_client)
-        return await rust_client.send_http1_request(
+        completion = _NativeCompletion(asyncio.get_running_loop())
+        rust_client.start_http1_request(
+            completion,
             connection,
+            host,
+            port,
+            connect_max_headers,
+            sock_connect,
+            tls,
+            verify_tls,
+            tls_server_name,
             method,
             target,
             version_major,
             version_minor,
             headers,
             upload_cursor,
+            buffered_body,
             content_length,
             compression,
             expect_continue,
@@ -1510,3 +1753,4 @@ class RustClientEngine:
             max_headers,
             sock_read,
         )
+        return cast(NativeResponse, await completion)
