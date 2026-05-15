@@ -94,7 +94,7 @@ The client session supports the context manager protocol for self closing.
       support custom connectors or custom request/response classes. Experimental
       engines may also support only a subset of upload body kinds and raise
       :exc:`NotImplementedError` for unsupported ones.
-      :class:`aiohttp.RustClientEngine` is the first experimental native engine;
+      :class:`aiohttp_rs.RustClientEngine` is the first experimental native engine;
       it currently supports ``http://`` requests plus ``https://`` requests with
       boolean ``ssl=`` values, :class:`aiohttp.Fingerprint`, and
       ``server_hostname=``, performs native response decompression for
@@ -1118,7 +1118,7 @@ Client Engines
    behavior documented by :class:`ClientSession`.
 
 
-.. class:: RustClientEngine()
+.. class:: aiohttp_rs.RustClientEngine()
 
    Experimental native client engine backed by Rust networking code.
 

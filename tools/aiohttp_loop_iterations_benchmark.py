@@ -11,7 +11,8 @@ from dataclasses import dataclass
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any, Literal, cast
 
-from aiohttp import ClientSession, RustClientEngine, TCPConnector
+from aiohttp import ClientSession, TCPConnector
+from aiohttp_rs import RustClientEngine
 from aiohttp.client_engine import AsyncioClientEngine, ClientEngine
 
 Method = Literal["GET", "POST"]

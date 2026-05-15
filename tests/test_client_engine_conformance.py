@@ -17,14 +17,14 @@ from aiohttp import (
     ClientResponse,
     ClientSession,
     FormData,
-    RustClientEngine,
     hdrs,
     web,
 )
 from aiohttp.pytest_plugin import AiohttpServer
+from aiohttp_rs import RustClientEngine
 
 try:
-    from aiohttp import _rust_client as _native_client  # noqa: F401
+    from aiohttp_rs import _rust_client as _native_client  # noqa: F401
 except ImportError:
     _RUST_AVAILABLE = False
 else:
@@ -37,7 +37,7 @@ ClientEngineName = Literal["asyncio", "rust"]
 @pytest.fixture(params=("asyncio", "rust"))
 def client_engine_name(request: pytest.FixtureRequest) -> ClientEngineName:
     if request.param == "rust" and not _RUST_AVAILABLE:
-        pytest.skip("aiohttp._rust_client is not available")
+        pytest.skip("aiohttp_rs._rust_client is not available")
     return request.param
 
 

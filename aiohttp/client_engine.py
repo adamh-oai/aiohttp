@@ -2,27 +2,18 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
-import ssl
 from collections.abc import AsyncIterator, Awaitable, Callable
 from enum import Enum
-from hashlib import sha256
-from typing import TYPE_CHECKING, Any, NoReturn, Optional, Protocol, cast
+from typing import TYPE_CHECKING, Any, NoReturn, Optional, Protocol
 
 import attr
-from multidict import CIMultiDict, CIMultiDictProxy
+from multidict import CIMultiDict
 
-from . import hdrs
 from .abc import AbstractStreamWriter
 from .client_exceptions import (
-    ClientConnectorCertificateError,
-    ClientConnectorSSLError,
     ClientPayloadError,
-    ClientResponseError,
     ConnectionTimeoutError,
-    ServerFingerprintMismatch,
     SocketTimeoutError,
-    cert_errors,
-    ssl_errors,
 )
 from .compression_utils import (
     HAS_BROTLI,
@@ -32,13 +23,12 @@ from .compression_utils import (
     ZSTDDecompressor,
 )
 from .helpers import EMPTY_BODY_METHODS, _EXC_SENTINEL, BaseTimerContext, TimerNoop
-from .http import HttpVersion
-from .http_exceptions import ContentEncodingError, HttpProcessingError, LineTooLong
+from .http_exceptions import ContentEncodingError, LineTooLong
 from .http_parser import RawResponseMessage
 
 if TYPE_CHECKING:
     from .client import ClientTimeout
-    from .client_reqrep import ClientRequest, ClientResponse, PreparedClientRequest
+    from .client_reqrep import ClientRequest, ClientResponse
     from .connector import BaseConnector, Connection
     from .payload import Payload
     from .tracing import Trace
@@ -46,7 +36,6 @@ if TYPE_CHECKING:
 __all__ = (
     "AsyncioClientEngine",
     "AsyncioClientExchange",
-    "RustClientEngine",
     "ClientBodyStream",
     "ClientConnection",
     "ClientEngine",
@@ -928,7 +917,7 @@ class _RustClientBodyStream:
             error = SocketTimeoutError("Timeout on reading data from socket")
             self._exception = error
             raise error from exc
-        except ValueError as exc:
+        except ValueError:
             if self._compression is None:
                 raise
             self._raise_payload_error(
@@ -1211,7 +1200,7 @@ class _RustClientExchange:
         message: RawResponseMessage,
         body: bytes | _NativeBody,
         *,
-        engine: "RustClientEngine | None" = None,
+        engine: Any | None = None,
         connection_key: NativeConnectionKey | None = None,
         native_connection: _NativeConnection | None = None,
         force_close: bool = False,
@@ -1331,426 +1320,3 @@ class _RustClientExchange:
         callbacks, self._callbacks = self._callbacks, []
         for callback in callbacks:
             callback()
-
-
-class RustClientEngine:
-    capabilities = ClientEngineCapabilities()
-    allowed_protocol_schema_set = frozenset({"http", "https"})
-
-    def __init__(self) -> None:
-        self._closed = False
-        self._available_connections: dict[
-            NativeConnectionKey, list[_NativeConnection]
-        ] = {}
-        self._connections: set[_NativeConnection] = set()
-
-    @property
-    def closed(self) -> bool:
-        return self._closed
-
-    async def close(self) -> None:
-        self._closed = True
-        connections = tuple(self._connections)
-        await asyncio.gather(
-            *(connection.wait_closed() for connection in connections)
-        )
-        self._available_connections.clear()
-        self._connections.clear()
-
-    async def send_one_attempt(
-        self,
-        request: "ClientRequest",
-        traces: list["Trace"],
-        options: AttemptOptions,
-    ) -> "ClientResponse":
-        self._validate_request(request)
-        self._validate_options(options)
-        prepared = request.prepare_for_send(force_close=False)
-        self._validate_prepared(prepared)
-        if hdrs.ACCEPT_ENCODING in prepared.auto_headers:
-            prepared.headers[hdrs.ACCEPT_ENCODING] = "gzip, deflate, br, zstd"
-        native_buffered_body = (
-            prepared.buffered_body
-            if not prepared.expect_continue and prepared.compression is None
-            else None
-        )
-        host = request.url.raw_host or ""
-        tls_server_name = (
-            (request.server_hostname or host).rstrip(".")
-            if request.url.scheme == "https"
-            else None
-        )
-        tls_fingerprint = self._tls_fingerprint(request)
-        connection_key = (
-            request.url.scheme,
-            host,
-            request.url.port or (443 if request.url.scheme == "https" else 80),
-            options.max_headers,
-            request.url.scheme != "https" or request.ssl is True,
-            tls_server_name,
-            tls_fingerprint,
-        )
-        native_connection = self._take_available_connection(connection_key)
-        open_in_native_request = (
-            native_connection is None and tls_fingerprint is None
-        )
-        if not open_in_native_request:
-            native_connection = await self._acquire_connection(
-                connection_key,
-                request=request,
-                traces=traces,
-                sock_connect=options.timeout.sock_connect,
-                available=native_connection,
-            )
-            await self._check_fingerprint(request, native_connection, tls_fingerprint)
-        try:
-            if open_in_native_request:
-                for trace in traces:
-                    await trace.send_connection_create_start()
-            if traces:
-                await request._on_headers_request_sent(
-                    prepared.method,
-                    request.url,
-                    prepared.headers,
-                )
-            raw_response = await self._send_http1_request(
-                native_connection,
-                host,
-                request.url.port
-                or (443 if request.url.scheme == "https" else 80),
-                options.max_headers,
-                options.timeout.sock_connect,
-                request.url.scheme == "https",
-                request.url.scheme != "https" or request.ssl is True,
-                tls_server_name,
-                prepared.method,
-                prepared.target,
-                prepared.version.major,
-                prepared.version.minor,
-                list(prepared.headers.items()),
-                (
-                    None
-                    if native_buffered_body is not None
-                    else _UploadCursor(
-                        prepared.upload_source,
-                        on_chunk=(
-                            (
-                                lambda chunk: request._on_chunk_request_sent(
-                                    prepared.method,
-                                    request.url,
-                                    chunk,
-                                )
-                            )
-                            if traces
-                            else None
-                        ),
-                    )
-                ),
-                buffered_body=native_buffered_body,
-                content_length=prepared.content_length,
-                compression=prepared.compression,
-                expect_continue=prepared.expect_continue,
-                read_until_eof=options.read_until_eof,
-                auto_decompress=options.auto_decompress,
-                skip_payload=request.method in EMPTY_BODY_METHODS,
-                max_headers=options.max_headers,
-                sock_read=options.timeout.sock_read,
-            )
-        except cert_errors as exc:
-            if native_connection is not None:
-                self._close_connection(native_connection)
-            raise ClientConnectorCertificateError(request.connection_key, exc) from exc
-        except ssl_errors as exc:
-            if native_connection is not None:
-                self._close_connection(native_connection)
-            raise ClientConnectorSSLError(request.connection_key, exc) from exc
-        except _NATIVE_TIMEOUT_ERRORS as exc:
-            if native_connection is not None:
-                self._close_connection(native_connection)
-            if open_in_native_request and exc.args == ("Connection timeout",):
-                raise ConnectionTimeoutError(
-                    f"Connection timeout to host {connection_key[0]}://"
-                    f"{connection_key[1]}:{connection_key[2]}"
-                ) from exc
-            raise SocketTimeoutError("Timeout on reading data from socket") from exc
-        except HttpProcessingError as exc:
-            if native_connection is not None:
-                self._close_connection(native_connection)
-            response = request._create_response(None)
-            raise ClientResponseError(
-                response.request_info,
-                response.history,
-                status=exc.code,
-                message=exc.message,
-                headers=exc.headers,
-            ) from exc
-        (
-            version_minor,
-            code,
-            reason,
-            raw_headers,
-            response_body,
-            native_connection,
-            should_close,
-            compression,
-            upgrade,
-            chunked,
-        ) = raw_response
-        if open_in_native_request:
-            self._connections.add(native_connection)
-            for trace in traces:
-                await trace.send_connection_create_end()
-
-        headers = CIMultiDict[str]()
-        for raw_name, raw_value in raw_headers:
-            headers.add(
-                raw_name.decode("utf-8", "surrogateescape"),
-                raw_value.decode("utf-8", "surrogateescape"),
-            )
-        message = RawResponseMessage(
-            HttpVersion(1, version_minor),
-            code,
-            reason,
-            CIMultiDictProxy(headers),
-            tuple(raw_headers),
-            should_close,
-            compression,
-            upgrade,
-            chunked,
-        )
-        response = request._create_response(None)
-        await response.start(
-            _RustClientExchange(
-                message,
-                response_body,
-                engine=self,
-                connection_key=connection_key,
-                native_connection=native_connection,
-                force_close=self._request_forces_close(prepared),
-                timer=options.timer,
-                auto_decompress=options.auto_decompress,
-                compression=compression,
-            )
-        )
-        return response
-
-    def _validate_request(self, request: "ClientRequest") -> None:
-        if isinstance(request.ssl, ssl.SSLContext):
-            raise NotImplementedError(
-                "RustClientEngine does not support SSLContext ssl= values"
-            )
-        if request.proxy is not None:
-            raise NotImplementedError("RustClientEngine does not support proxies")
-
-    def _validate_prepared(self, prepared: "PreparedClientRequest") -> None:
-        pass
-
-    def _validate_options(self, options: AttemptOptions) -> None:
-        if options.read_bufsize != DEFAULT_NATIVE_READ_BUFSIZE:
-            raise NotImplementedError(
-                "RustClientEngine does not support custom read_bufsize values"
-            )
-        if options.max_line_size != 8190:
-            raise NotImplementedError(
-                "RustClientEngine does not support custom max_line_size values"
-            )
-        if options.max_field_size != 8190:
-            raise NotImplementedError(
-                "RustClientEngine does not support custom max_field_size values"
-            )
-
-    async def _acquire_connection(
-        self,
-        key: NativeConnectionKey,
-        *,
-        request: "ClientRequest",
-        traces: list["Trace"],
-        sock_connect: float | None,
-        available: _NativeConnection | None = None,
-    ) -> _NativeConnection:
-        if available is not None:
-            for trace in traces:
-                await trace.send_connection_reuseconn()
-            return available
-
-        try:
-            for trace in traces:
-                await trace.send_connection_create_start()
-            connection = await self._open_http1_connection(
-                *key,
-                sock_connect=sock_connect,
-            )
-            for trace in traces:
-                await trace.send_connection_create_end()
-        except cert_errors as exc:
-            raise ClientConnectorCertificateError(request.connection_key, exc) from exc
-        except ssl_errors as exc:
-            raise ClientConnectorSSLError(request.connection_key, exc) from exc
-        except _NATIVE_TIMEOUT_ERRORS as exc:
-            raise ConnectionTimeoutError(
-                f"Connection timeout to host {key[0]}://{key[1]}:{key[2]}"
-            ) from exc
-        self._connections.add(connection)
-        return connection
-
-    def _take_available_connection(
-        self, key: NativeConnectionKey
-    ) -> _NativeConnection | None:
-        available = self._available_connections.get(key)
-        while available:
-            connection = available.pop()
-            if not connection.closed:
-                return connection
-            self._connections.discard(connection)
-        if available == []:
-            self._available_connections.pop(key, None)
-        return None
-
-    def _release_connection(
-        self,
-        key: NativeConnectionKey,
-        connection: _NativeConnection,
-    ) -> None:
-        if self._closed or connection.closed:
-            self._close_connection(connection)
-            return
-        self._available_connections.setdefault(key, []).append(connection)
-
-    def _close_connection(self, connection: _NativeConnection) -> None:
-        connection.close()
-        self._connections.discard(connection)
-
-    def _request_forces_close(self, prepared: "PreparedClientRequest") -> bool:
-        connection = prepared.headers.get("Connection")
-        if connection is None:
-            return False
-        return any(
-            token.strip().lower() == "close" for token in connection.split(",")
-        )
-
-    def _tls_fingerprint(self, request: "ClientRequest") -> bytes | None:
-        if type(request.ssl) is bool:
-            return None
-        return request.ssl.fingerprint  # type: ignore[union-attr]
-
-    async def _check_fingerprint(
-        self,
-        request: "ClientRequest",
-        connection: _NativeConnection,
-        expected: bytes | None,
-    ) -> None:
-        if expected is None or request.url.scheme != "https":
-            return
-        peer_certificate_der = connection.peer_certificate_der()
-        if peer_certificate_der is None:
-            await self._close_connection_and_wait(connection)
-            raise RuntimeError(
-                "RustClientEngine TLS connection is missing peer certificate"
-            )
-        got = sha256(peer_certificate_der).digest()
-        if got != expected:
-            await self._close_connection_and_wait(connection)
-            raise ServerFingerprintMismatch(
-                expected,
-                got,
-                request.url.raw_host or "",
-                request.url.port or 443,
-            )
-
-    async def _close_connection_and_wait(self, connection: _NativeConnection) -> None:
-        self._close_connection(connection)
-        await connection.wait_closed()
-
-    async def _open_http1_connection(
-        self,
-        scheme: str,
-        host: str,
-        port: int,
-        max_headers: int,
-        verify_tls: bool,
-        tls_server_name: str | None,
-        tls_fingerprint: bytes | None,
-        *,
-        sock_connect: float | None,
-    ) -> _NativeConnection:
-        try:
-            from . import _rust_client
-        except ImportError as exc:
-            raise RuntimeError(
-                "RustClientEngine requires the aiohttp._rust_client extension"
-            ) from exc
-
-        rust_client = cast(_RustClientModule, _rust_client)
-        return await rust_client.open_http1_connection(
-            host,
-            port,
-            max_headers,
-            sock_connect,
-            scheme == "https",
-            verify_tls,
-            tls_server_name,
-        )
-
-    async def _send_http1_request(
-        self,
-        connection: _NativeConnection | None,
-        host: str,
-        port: int,
-        connect_max_headers: int,
-        sock_connect: float | None,
-        tls: bool,
-        verify_tls: bool,
-        tls_server_name: str | None,
-        method: str,
-        target: str,
-        version_major: int,
-        version_minor: int,
-        headers: list[tuple[str, str]],
-        upload_cursor: _UploadCursor | None,
-        *,
-        buffered_body: bytes | None,
-        content_length: int | None,
-        compression: str | None,
-        expect_continue: bool,
-        read_until_eof: bool,
-        auto_decompress: bool,
-        skip_payload: bool,
-        max_headers: int,
-        sock_read: float | None,
-    ) -> NativeResponse:
-        try:
-            from . import _rust_client
-        except ImportError as exc:
-            raise RuntimeError(
-                "RustClientEngine requires the aiohttp._rust_client extension"
-            ) from exc
-
-        rust_client = cast(_RustClientModule, _rust_client)
-        completion = _NativeCompletion(asyncio.get_running_loop())
-        rust_client.start_http1_request(
-            completion,
-            connection,
-            host,
-            port,
-            connect_max_headers,
-            sock_connect,
-            tls,
-            verify_tls,
-            tls_server_name,
-            method,
-            target,
-            version_major,
-            version_minor,
-            headers,
-            upload_cursor,
-            buffered_body,
-            content_length,
-            compression,
-            expect_continue,
-            read_until_eof,
-            auto_decompress,
-            skip_payload,
-            max_headers,
-            sock_read,
-        )
-        return cast(NativeResponse, await completion)

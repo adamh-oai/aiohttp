@@ -6,7 +6,6 @@ requires = [
     # Don't bump too early to give distributors time to update
     # their setuptools version.
     "setuptools >= 67.0",
-    "setuptools-rust",
 ]
 build-backend = "setuptools.build_meta"
 

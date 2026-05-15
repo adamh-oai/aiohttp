@@ -1,5 +1,5 @@
 __version__ = "3.13.5"
-__dist_version__ = "3.13.5+native5"
+__dist_version__ = "3.13.5+native6"
 
 from typing import TYPE_CHECKING, Tuple
 
@@ -59,7 +59,6 @@ from .client_engine import (
     ClientEngineCapabilities,
     ClientExchange,
     PayloadUploadSource,
-    RustClientEngine,
     UploadKind,
     UploadPlan,
     UploadReplayability,
@@ -198,7 +197,6 @@ __all__: Tuple[str, ...] = (
     "ClientHandlerType",
     "AsyncioClientEngine",
     "AsyncioClientExchange",
-    "RustClientEngine",
     "ClientBodyStream",
     "ClientConnection",
     "ClientEngine",

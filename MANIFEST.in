@@ -9,7 +9,6 @@ graft examples
 graft tests
 graft tools
 graft requirements
-graft rust
 graft vendor
 global-exclude *.pyc
 global-exclude *.pyd
