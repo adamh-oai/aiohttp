@@ -248,8 +248,8 @@ convenient you should use them carefully. All these methods load the
 whole response in memory.  For example if you want to download several
 gigabyte sized files, these methods will load all the data in
 memory. Instead you can use the :attr:`~ClientResponse.content`
-attribute. It provides the :class:`aiohttp.StreamReader` reading API.
-The ``gzip`` and ``deflate`` transfer-encodings are
+attribute. It is an instance of the :class:`aiohttp.StreamReader`
+class. The ``gzip`` and ``deflate`` transfer-encodings are
 automatically decoded for you::
 
     async with session.get('https://api.github.com/events') as resp:
@@ -363,9 +363,9 @@ Or you can use *asynchronous generator*::
       print(await resp.text())
 
 
-Because the :attr:`~aiohttp.ClientResponse.content` attribute provides
-the :class:`~aiohttp.StreamReader` async iterator protocol, you can
-chain get and post requests together::
+Because the :attr:`~aiohttp.ClientResponse.content` attribute is a
+:class:`~aiohttp.StreamReader` (provides async iterator protocol), you
+can chain get and post requests together::
 
    resp = await session.get('http://python.org')
    await session.post('http://httpbin.org/post',
