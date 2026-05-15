@@ -48,7 +48,7 @@ def main() -> None:
     )
     parser.add_argument(
         "--remote",
-        default="fork",
+        default="origin",
         help="Git remote that should receive the release tag (default: fork)",
     )
     args = parser.parse_args()
