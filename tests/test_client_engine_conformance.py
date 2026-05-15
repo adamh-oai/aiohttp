@@ -21,11 +21,12 @@ from aiohttp import (
     web,
 )
 from aiohttp.pytest_plugin import AiohttpServer
-from aiohttp_rs import RustClientEngine
 
 try:
+    from aiohttp_rs import RustClientEngine
     from aiohttp_rs import _rust_client as _native_client  # noqa: F401
 except ImportError:
+    RustClientEngine = None  # type: ignore[assignment, misc]
     _RUST_AVAILABLE = False
 else:
     _RUST_AVAILABLE = True
@@ -45,6 +46,7 @@ def make_session(
     client_engine_name: ClientEngineName, **kwargs: object
 ) -> ClientSession:
     if client_engine_name == "rust":
+        assert RustClientEngine is not None
         return ClientSession(client_engine=RustClientEngine(), **kwargs)
     return ClientSession(**kwargs)
 
