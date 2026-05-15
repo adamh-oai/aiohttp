@@ -69,6 +69,7 @@ extensions = [
     Extension("aiohttp._websocket.reader_c", ["aiohttp/_websocket/reader_c.c"]),
 ]
 
+
 build_type = "Pure" if NO_EXTENSIONS else "Accelerated"
 setup_kwargs = {} if NO_EXTENSIONS else {"ext_modules": extensions}
 
