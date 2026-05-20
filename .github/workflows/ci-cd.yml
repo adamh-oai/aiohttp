@@ -246,24 +246,24 @@ jobs:
         PIP_USER: 1
       run: |
         python -m coverage xml
-    - name: Upload coverage
-      uses: codecov/codecov-action@v5
-      with:
-        files: ./coverage.xml
-        flags: >-
-          CI-GHA,OS-${{
-            runner.os
-          }},VM-${{
-            matrix.os
-          }},Py-${{
-            steps.python-install.outputs.python-version
-          }}
-        token: ${{ secrets.CODECOV_TOKEN }}
-    - name: Upload test results to Codecov
-      if: ${{ !cancelled() }}
-      uses: codecov/test-results-action@v1
-      with:
-        token: ${{ secrets.CODECOV_TOKEN }}
+    # - name: Upload coverage
+    #   uses: codecov/codecov-action@v5
+    #   with:
+    #     files: ./coverage.xml
+    #     flags: >-
+    #       CI-GHA,OS-${{
+    #         runner.os
+    #       }},VM-${{
+    #         matrix.os
+    #       }},Py-${{
+    #         steps.python-install.outputs.python-version
+    #       }}
+    #     token: ${{ secrets.CODECOV_TOKEN }}
+    # - name: Upload test results to Codecov
+    #   if: ${{ !cancelled() }}
+    #   uses: codecov/test-results-action@v1
+    #   with:
+    #     token: ${{ secrets.CODECOV_TOKEN }}
 
   benchmark:
     name: Benchmark
@@ -319,12 +319,12 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-    - name: Trigger codecov notification
-      uses: codecov/codecov-action@v5
-      with:
-        token: ${{ secrets.CODECOV_TOKEN }}
-        fail_ci_if_error: true
-        run_command: send-notifications
+    # - name: Trigger codecov notification
+    #   uses: codecov/codecov-action@v5
+    #   with:
+    #     token: ${{ secrets.CODECOV_TOKEN }}
+    #     fail_ci_if_error: true
+    #     run_command: send-notifications
     - name: Decide whether the needed jobs succeeded or failed
       uses: re-actors/alls-green@release/v1
       with:
